@@ -143,7 +143,7 @@ pub fn get_jj_diff(revision: &Option<String>, debug: bool) -> Result<String> {
     if debug {
         eprintln!("debug: jj diff returned {} bytes", output.stdout.len());
     }
-    Ok(String::from_utf8(output.stdout)?)
+    Ok(preserve_crlf(&String::from_utf8(output.stdout)?))
 }
 
 /// Run `jj diff --git --from FROM --to TO` and return the raw output.
@@ -164,5 +164,37 @@ pub fn get_jj_diff_from_to(from: &str, to: &str, debug: bool) -> Result<String> 
     if debug {
         eprintln!("debug: jj diff returned {} bytes", output.stdout.len());
     }
-    Ok(String::from_utf8(output.stdout)?)
+    Ok(preserve_crlf(&String::from_utf8(output.stdout)?))
+}
+
+/// Protect the '\r' of CRLF content lines from `parse_diff`.
+///
+/// Content lines from CRLF files end with "\r\n" in the diff — the '\r' is
+/// part of the content. `parse_diff` splits with `str::lines()`, which strips
+/// "\r\n" as a unit, so patches rebuilt from the parsed hunks would silently
+/// lose the '\r' and fail to apply. Double the '\r' so one survives.
+fn preserve_crlf(raw: &str) -> String {
+    raw.replace("\r\n", "\r\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserve_crlf_keeps_cr_through_parse() {
+        let raw = "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n line1\r\n-line2\r\n+line2 changed\r\n";
+        let hunks = parse_diff(&preserve_crlf(raw));
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(
+            hunks[0].lines,
+            vec![" line1\r", "-line2\r", "+line2 changed\r"]
+        );
+    }
+
+    #[test]
+    fn preserve_crlf_leaves_lf_content_alone() {
+        let raw = "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        assert_eq!(preserve_crlf(raw), raw);
+    }
 }

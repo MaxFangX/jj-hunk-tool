@@ -1395,6 +1395,55 @@ fn restore_invalid_id() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// CRLF files
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn split_crlf_file() {
+    let repo = TestRepo::new();
+    repo.commit_file("crlf.txt", "line1\r\nline2\r\nline3\r\n");
+    let changed = "line1\r\nline2 changed\r\nline3\r\nline4\r\n";
+    repo.write_file("crlf.txt", changed);
+
+    let id = repo.get_single_hunk_id(&[]);
+    repo.tool_ok(&["split", &id, "-m", "crlf change"]);
+
+    assert_eq!(repo.read_file("crlf.txt"), changed, "CRLF must survive");
+    let wc_diff = repo.jj_diff("@");
+    assert!(wc_diff.trim().is_empty(), "everything split: {wc_diff}");
+}
+
+#[test]
+fn restore_crlf_hunk() {
+    let repo = TestRepo::new();
+    repo.commit_file("crlf.txt", "line1\r\nline2\r\nline3\r\n");
+    repo.write_file("crlf.txt", "line1\r\nline2 changed\r\nline3\r\n");
+
+    let id = repo.get_single_hunk_id(&[]);
+    repo.tool_ok(&["restore", &id]);
+
+    assert_eq!(repo.read_file("crlf.txt"), "line1\r\nline2\r\nline3\r\n");
+}
+
+#[test]
+fn diffedit_crlf_file() {
+    let repo = TestRepo::new();
+    let content = format!("top\r\n{}bottom\r\n", "mid\r\n".repeat(20));
+    repo.commit_file("crlf.txt", &content);
+    let changed = content.replace("top", "TOP").replace("bottom", "BOTTOM");
+    repo.write_file("crlf.txt", &changed);
+    repo.jj(&["commit", "-m", "change both ends"]);
+
+    let ids = repo.get_hunk_ids(&["-r", "@-"]);
+    assert_eq!(ids.len(), 2);
+    repo.tool_ok(&["diffedit", &ids[0].0, "-r", "@-"]);
+
+    let diff = repo.jj_diff("@-");
+    assert!(diff.contains("TOP"), "kept hunk should remain: {diff}");
+    assert!(!diff.contains("BOTTOM"), "unselected hunk removed: {diff}");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // _jj-tool protocol
 // ──────────────────────────────────────────────────────────────────────────────
 
