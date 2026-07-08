@@ -1332,6 +1332,37 @@ fn restore_new_file() {
 }
 
 #[test]
+fn restore_deleted_file() {
+    let repo = TestRepo::new();
+    repo.commit_file("doomed.txt", "line1\nline2\n");
+    std::fs::remove_file(repo.path().join("doomed.txt")).unwrap();
+
+    let id = repo.get_hunk_id_for_file("doomed.txt", &[]);
+    repo.tool_ok(&["restore", &id]);
+
+    assert_eq!(
+        repo.read_file("doomed.txt"),
+        "line1\nline2\n",
+        "deleted file should be restored"
+    );
+}
+
+#[test]
+fn restore_with_line_range_on_mixed_hunk() {
+    let repo = TestRepo::new();
+    repo.commit_file("f.txt", "a\nb\nc\n");
+    // One hunk with a replacement (b -> B) and an addition (d)
+    repo.write_file("f.txt", "a\nB\nc\nd\n");
+
+    // Hunk lines: 1=" a", 2="-b", 3="+B", 4=" c", 5="+d".
+    // Restore only the addition of "d"; the b -> B change must remain.
+    let id = repo.get_single_hunk_id(&[]);
+    repo.tool_ok(&["restore", &format!("{id}:5")]);
+
+    assert_eq!(repo.read_file("f.txt"), "a\nB\nc\n");
+}
+
+#[test]
 fn restore_one_of_two_hunks() {
     let repo = TestRepo::new();
     let content = repo.write_two_hunk_file("f.txt");
@@ -1372,14 +1403,14 @@ fn tool_binary() -> PathBuf {
 }
 
 fn run_jj_tool(left: &Path, right: &Path, patch_path: Option<&Path>) -> std::process::Output {
-    run_jj_tool_with_reverse(left, right, patch_path, false)
+    run_jj_tool_with_env(left, right, patch_path, &[])
 }
 
-fn run_jj_tool_with_reverse(
+fn run_jj_tool_with_env(
     left: &Path,
     right: &Path,
     patch_path: Option<&Path>,
-    reverse: bool,
+    env: &[(&str, &str)],
 ) -> std::process::Output {
     let mut cmd = Command::new(tool_binary());
     cmd.args([
@@ -1390,8 +1421,8 @@ fn run_jj_tool_with_reverse(
     if let Some(p) = patch_path {
         cmd.env("JJ_HUNK_TOOL_PATCH", p);
     }
-    if reverse {
-        cmd.env("JJ_HUNK_TOOL_REVERSE", "1");
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     cmd.output().unwrap()
 }
@@ -1419,30 +1450,37 @@ fn jj_tool_basic_reset_and_apply() {
 }
 
 #[test]
-fn jj_tool_reverse_mode() {
+fn jj_tool_in_place_mode() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
 
-    // Left has the changed state (like restore --changes-in where left=current)
-    std::fs::write(left.path().join("file.txt"), "hello\nworld\n").unwrap();
-    // Right has the parent state
-    std::fs::write(right.path().join("file.txt"), "hello\n").unwrap();
+    std::fs::write(left.path().join("file.txt"), "hello\n").unwrap();
+    std::fs::write(right.path().join("file.txt"), "hello\nworld\n").unwrap();
+    // A change the patch doesn't cover; reset mode would wipe it.
+    std::fs::write(right.path().join("extra.bin"), b"\x00\x01").unwrap();
 
-    // Forward patch (adds "world")
+    // Patch that removes "world" from the current (right) state
     let patch_file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         patch_file.path(),
-        "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1,2 @@\n hello\n+world\n",
+        "--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1 @@\n hello\n-world\n",
     )
     .unwrap();
 
-    // With reverse: reset right to left (hello\nworld\n), then apply patch in reverse (remove world)
-    let output =
-        run_jj_tool_with_reverse(left.path(), right.path(), Some(patch_file.path()), true);
+    let output = run_jj_tool_with_env(
+        left.path(),
+        right.path(),
+        Some(patch_file.path()),
+        &[("JJ_HUNK_TOOL_IN_PLACE", "1")],
+    );
     assert!(output.status.success());
 
     let content = std::fs::read_to_string(right.path().join("file.txt")).unwrap();
-    assert_eq!(content, "hello\n", "reverse should undo the patch");
+    assert_eq!(content, "hello\n", "patch should apply to right in place");
+    assert!(
+        right.path().join("extra.bin").exists(),
+        "in-place mode must not touch files outside the patch"
+    );
 }
 
 #[test]

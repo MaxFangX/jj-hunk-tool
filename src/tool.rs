@@ -13,16 +13,14 @@ use syntect::util::as_24_bit_terminal_escaped;
 use git_surgeon::diff::DiffHunk;
 
 const PATCH_ENV_VAR: &str = "JJ_HUNK_TOOL_PATCH";
-const REVERSE_ENV_VAR: &str = "JJ_HUNK_TOOL_REVERSE";
 const IN_PLACE_ENV_VAR: &str = "JJ_HUNK_TOOL_IN_PLACE";
 
 /// How the `_jj-tool` handler transforms the `$right` directory.
 #[derive(Clone, Copy)]
 enum ApplyMode {
-    /// Reset $right to $left, then apply the patch (split, squash, absorb).
-    Forward,
-    /// Reset $right to $left, then reverse-apply the patch (restore).
-    Reverse,
+    /// Reset $right to $left, then apply the patch (split, squash, restore,
+    /// absorb).
+    Reset,
     /// Apply the patch to $right as-is, without resetting (diffedit). Leaves
     /// changes a text patch can't represent (binary files, renames, mode
     /// changes) untouched instead of silently deleting them.
@@ -282,14 +280,8 @@ fn run_jj_with_tool(
     cmd.args(["--config", config_edit_args]);
     cmd.args(["--tool", "jj-hunk-tool"]);
     cmd.env(PATCH_ENV_VAR, patch_file.path());
-    match mode {
-        ApplyMode::Forward => {}
-        ApplyMode::Reverse => {
-            cmd.env(REVERSE_ENV_VAR, "1");
-        }
-        ApplyMode::InPlace => {
-            cmd.env(IN_PLACE_ENV_VAR, "1");
-        }
+    if let ApplyMode::InPlace = mode {
+        cmd.env(IN_PLACE_ENV_VAR, "1");
     }
 
     if debug {
@@ -344,7 +336,7 @@ pub fn split_hunks(
     }
     args.extend_from_slice(extra_args);
 
-    run_jj_with_tool(&args, &patch_content, ApplyMode::Forward, debug)?;
+    run_jj_with_tool(&args, &patch_content, ApplyMode::Reset, debug)?;
     Ok(())
 }
 
@@ -356,7 +348,7 @@ pub fn squash_hunks(specs: &[HunkSpec<'_>], extra_args: &[&str], debug: bool) ->
     }
     let mut args = vec!["squash"];
     args.extend_from_slice(extra_args);
-    run_jj_with_tool(&args, &patch_content, ApplyMode::Forward, debug)
+    run_jj_with_tool(&args, &patch_content, ApplyMode::Reset, debug)
 }
 
 /// Rewrite a revision in-place, keeping only the selected hunks.
@@ -444,14 +436,17 @@ fn invert_ranges(ranges: &[(usize, usize)], len: usize) -> Vec<(usize, usize)> {
 
 /// Restore (undo) selected hunks. The caller provides the jj-specific args
 /// (e.g. ["--changes-in", "@"] or ["--from", "x", "--into", "y"]).
+///
+/// jj hands the tool $left = the destination's current state; the reversed
+/// patch applied on top of it undoes the selected hunks.
 pub fn restore_hunks(specs: &[HunkSpec<'_>], jj_extra_args: &[&str], debug: bool) -> Result<()> {
-    let patch_content = build_combined_patch(specs, false)?;
+    let patch_content = build_combined_patch(specs, true)?;
     if patch_content.is_empty() {
         bail!("no hunks selected");
     }
     let mut args = vec!["restore"];
     args.extend_from_slice(jj_extra_args);
-    run_jj_with_tool(&args, &patch_content, ApplyMode::Reverse, debug)
+    run_jj_with_tool(&args, &patch_content, ApplyMode::Reset, debug)
 }
 
 /// A hunk fingerprint for stable matching across re-computations.
@@ -1092,7 +1087,7 @@ pub fn absorb_hunks(
         }
 
         let args: Vec<&str> = vec!["squash", "--from", source, "--into", target];
-        run_jj_with_tool(&args, &patch_content, ApplyMode::Forward, debug)?;
+        run_jj_with_tool(&args, &patch_content, ApplyMode::Reset, debug)?;
     }
 
     println!("To undo, run: jj op restore {pre_op_id}");
@@ -1369,7 +1364,7 @@ mod tests {
 /// 1. Read patch path from JJ_HUNK_TOOL_PATCH env var
 /// 2. Reset $right to match $left (copy all files from left, remove extras),
 ///    unless JJ_HUNK_TOOL_IN_PLACE is set
-/// 3. Apply the patch to $right (in reverse if JJ_HUNK_TOOL_REVERSE is set)
+/// 3. Apply the patch to $right
 /// 4. Remove files the patch marked as deleted (patch only empties them)
 pub fn jj_tool_apply(left: &str, right: &str) -> Result<()> {
     let patch_path = std::env::var(PATCH_ENV_VAR)
@@ -1386,12 +1381,8 @@ pub fn jj_tool_apply(left: &str, right: &str) -> Result<()> {
 
     // Step 2: Apply the pre-computed patch. Close stdin so patch fails
     // instead of prompting when it can't resolve a filename.
-    let reverse = std::env::var(REVERSE_ENV_VAR).is_ok();
     let mut patch_cmd = Command::new("patch");
     patch_cmd.args(["-p1", "--silent"]);
-    if reverse {
-        patch_cmd.arg("--reverse");
-    }
     patch_cmd.arg("-i").arg(&patch_path);
     patch_cmd.current_dir(right_path);
     patch_cmd.stdin(std::process::Stdio::null());
@@ -1407,15 +1398,10 @@ pub fn jj_tool_apply(left: &str, right: &str) -> Result<()> {
     let patch_text = std::fs::read_to_string(&patch_path)
         .with_context(|| format!("reading patch {patch_path}"))?;
     for hunk in git_surgeon::diff::parse_diff(&patch_text) {
-        let (gone_side, file) = if reverse {
-            (&hunk.old_file, &hunk.new_file)
-        } else {
-            (&hunk.new_file, &hunk.old_file)
-        };
-        if !crate::diff::is_dev_null(gone_side) {
+        if !crate::diff::is_dev_null(&hunk.new_file) {
             continue;
         }
-        let target = right_path.join(file);
+        let target = right_path.join(&hunk.old_file);
         if target.exists() && target.metadata()?.len() == 0 {
             std::fs::remove_file(&target)
                 .with_context(|| format!("removing deleted file {}", target.display()))?;
