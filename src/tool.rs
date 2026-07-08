@@ -95,7 +95,7 @@ fn format_hunk_display(hunk: &DiffHunk, color: bool) -> String {
             let highlighted = if prefix != "-" {
                 // Syntax highlight additions and context
                 highlighter
-                    .highlight_line(&content_with_nl, &ss)
+                    .highlight_line(&content_with_nl, ss)
                     .map(|ranges| {
                         let mut s = as_24_bit_terminal_escaped(&ranges, false);
                         // Strip trailing newline from highlighted output
@@ -1036,6 +1036,104 @@ fn execute_absorb(
     Ok(())
 }
 
+/// JJ tool protocol handler.
+///
+/// JJ invokes: `jj-hunk-tool _jj-tool $left $right`
+/// - `$left` = parent/base state directory (read-only)
+/// - `$right` = current state directory (writable)
+///
+/// Algorithm:
+/// 1. Read patch path from JJ_HUNK_TOOL_PATCH env var
+/// 2. Reset $right to match $left (copy all files from left, remove extras),
+///    unless JJ_HUNK_TOOL_IN_PLACE is set
+/// 3. Apply the patch to $right
+/// 4. Remove files the patch marked as deleted (patch only empties them)
+pub fn jj_tool_apply(left: &str, right: &str) -> Result<()> {
+    let patch_path = std::env::var(PATCH_ENV_VAR)
+        .with_context(|| format!("{PATCH_ENV_VAR} environment variable not set"))?;
+
+    let left_path = Path::new(left);
+    let right_path = Path::new(right);
+
+    // Step 1: Reset $right to $left state. In-place mode skips this so that
+    // changes the patch can't represent (binary files, renames) survive.
+    if std::env::var(IN_PLACE_ENV_VAR).is_err() {
+        reset_dir_to(left_path, right_path)?;
+    }
+
+    // Step 2: Apply the pre-computed patch. Close stdin so patch fails
+    // instead of prompting when it can't resolve a filename.
+    let mut patch_cmd = Command::new("patch");
+    patch_cmd.args(["-p1", "--silent"]);
+    patch_cmd.arg("-i").arg(&patch_path);
+    patch_cmd.current_dir(right_path);
+    patch_cmd.stdin(std::process::Stdio::null());
+    let status = patch_cmd.status().context("failed to run patch")?;
+
+    if !status.success() {
+        bail!("patch failed to apply (exit code: {:?})", status.code());
+    }
+
+    // Step 3: patch leaves a file emptied rather than deleted when a hunk's
+    // target side is /dev/null; jj would then record an emptied file instead
+    // of a deletion. Remove such files.
+    let patch_text = std::fs::read_to_string(&patch_path)
+        .with_context(|| format!("reading patch {patch_path}"))?;
+    for hunk in git_surgeon::diff::parse_diff(&patch_text) {
+        if !crate::diff::is_dev_null(&hunk.new_file) {
+            continue;
+        }
+        let target = right_path.join(&hunk.old_file);
+        if target.exists() && target.metadata()?.len() == 0 {
+            std::fs::remove_file(&target)
+                .with_context(|| format!("removing deleted file {}", target.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Reset `dst` directory to match `src` directory contents.
+fn reset_dir_to(src: &Path, dst: &Path) -> Result<()> {
+    remove_dir_contents(dst)?;
+    copy_dir_recursive(src, dst)?;
+    Ok(())
+}
+
+fn remove_dir_contents(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading dir {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("removing dir {}", path.display()))?;
+        } else {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing file {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src).with_context(|| format!("reading dir {}", src.display()))? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            std::fs::create_dir_all(&dst_path)
+                .with_context(|| format!("creating dir {}", dst_path.display()))?;
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path).with_context(|| {
+                format!("copying {} to {}", src_path.display(), dst_path.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1243,102 +1341,4 @@ mod tests {
             HunkFingerprint::from_hunk(&hunk2),
         );
     }
-}
-
-/// JJ tool protocol handler.
-///
-/// JJ invokes: `jj-hunk-tool _jj-tool $left $right`
-/// - `$left` = parent/base state directory (read-only)
-/// - `$right` = current state directory (writable)
-///
-/// Algorithm:
-/// 1. Read patch path from JJ_HUNK_TOOL_PATCH env var
-/// 2. Reset $right to match $left (copy all files from left, remove extras),
-///    unless JJ_HUNK_TOOL_IN_PLACE is set
-/// 3. Apply the patch to $right
-/// 4. Remove files the patch marked as deleted (patch only empties them)
-pub fn jj_tool_apply(left: &str, right: &str) -> Result<()> {
-    let patch_path = std::env::var(PATCH_ENV_VAR)
-        .with_context(|| format!("{PATCH_ENV_VAR} environment variable not set"))?;
-
-    let left_path = Path::new(left);
-    let right_path = Path::new(right);
-
-    // Step 1: Reset $right to $left state. In-place mode skips this so that
-    // changes the patch can't represent (binary files, renames) survive.
-    if std::env::var(IN_PLACE_ENV_VAR).is_err() {
-        reset_dir_to(left_path, right_path)?;
-    }
-
-    // Step 2: Apply the pre-computed patch. Close stdin so patch fails
-    // instead of prompting when it can't resolve a filename.
-    let mut patch_cmd = Command::new("patch");
-    patch_cmd.args(["-p1", "--silent"]);
-    patch_cmd.arg("-i").arg(&patch_path);
-    patch_cmd.current_dir(right_path);
-    patch_cmd.stdin(std::process::Stdio::null());
-    let status = patch_cmd.status().context("failed to run patch")?;
-
-    if !status.success() {
-        bail!("patch failed to apply (exit code: {:?})", status.code());
-    }
-
-    // Step 3: patch leaves a file emptied rather than deleted when a hunk's
-    // target side is /dev/null; jj would then record an emptied file instead
-    // of a deletion. Remove such files.
-    let patch_text = std::fs::read_to_string(&patch_path)
-        .with_context(|| format!("reading patch {patch_path}"))?;
-    for hunk in git_surgeon::diff::parse_diff(&patch_text) {
-        if !crate::diff::is_dev_null(&hunk.new_file) {
-            continue;
-        }
-        let target = right_path.join(&hunk.old_file);
-        if target.exists() && target.metadata()?.len() == 0 {
-            std::fs::remove_file(&target)
-                .with_context(|| format!("removing deleted file {}", target.display()))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Reset `dst` directory to match `src` directory contents.
-fn reset_dir_to(src: &Path, dst: &Path) -> Result<()> {
-    remove_dir_contents(dst)?;
-    copy_dir_recursive(src, dst)?;
-    Ok(())
-}
-
-fn remove_dir_contents(dir: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading dir {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-                .with_context(|| format!("removing dir {}", path.display()))?;
-        } else {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("removing file {}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(src).with_context(|| format!("reading dir {}", src.display()))? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if src_path.is_dir() {
-            std::fs::create_dir_all(&dst_path)
-                .with_context(|| format!("creating dir {}", dst_path.display()))?;
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path).with_context(|| {
-                format!("copying {} to {}", src_path.display(), dst_path.display())
-            })?;
-        }
-    }
-    Ok(())
 }
