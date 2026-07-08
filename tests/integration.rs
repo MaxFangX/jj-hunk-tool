@@ -917,6 +917,15 @@ fn split_deleted_file() {
 
     let parent_diff = repo.jj_diff("@-");
     assert!(parent_diff.contains("doomed.txt"));
+    assert!(
+        parent_diff.contains("deleted file mode"),
+        "split-off commit should delete the file, not empty it: {parent_diff}"
+    );
+    let wc_diff = repo.jj_diff("@");
+    assert!(
+        wc_diff.trim().is_empty(),
+        "nothing should remain after splitting the whole deletion: {wc_diff}"
+    );
 }
 
 #[test]

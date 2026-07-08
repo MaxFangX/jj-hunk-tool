@@ -1109,7 +1109,8 @@ pub fn jj_tool_apply(left: &str, right: &str) -> Result<()> {
     // Step 1: Reset $right to $left state
     reset_dir_to(left_path, right_path)?;
 
-    // Step 2: Apply the pre-computed patch
+    // Step 2: Apply the pre-computed patch. Close stdin so patch fails
+    // instead of prompting when it can't resolve a filename.
     let reverse = std::env::var(REVERSE_ENV_VAR).is_ok();
     let mut patch_cmd = Command::new("patch");
     patch_cmd.args(["-p1", "--silent"]);
@@ -1118,10 +1119,32 @@ pub fn jj_tool_apply(left: &str, right: &str) -> Result<()> {
     }
     patch_cmd.arg("-i").arg(&patch_path);
     patch_cmd.current_dir(right_path);
+    patch_cmd.stdin(std::process::Stdio::null());
     let status = patch_cmd.status().context("failed to run patch")?;
 
     if !status.success() {
         bail!("patch failed to apply (exit code: {:?})", status.code());
+    }
+
+    // Step 3: patch leaves a file emptied rather than deleted when a hunk's
+    // target side is /dev/null; jj would then record an emptied file instead
+    // of a deletion. Remove such files.
+    let patch_text = std::fs::read_to_string(&patch_path)
+        .with_context(|| format!("reading patch {patch_path}"))?;
+    for hunk in git_surgeon::diff::parse_diff(&patch_text) {
+        let (gone_side, file) = if reverse {
+            (&hunk.old_file, &hunk.new_file)
+        } else {
+            (&hunk.new_file, &hunk.old_file)
+        };
+        if !crate::diff::is_dev_null(gone_side) {
+            continue;
+        }
+        let target = right_path.join(file);
+        if target.exists() && target.metadata()?.len() == 0 {
+            std::fs::remove_file(&target)
+                .with_context(|| format!("removing deleted file {}", target.display()))?;
+        }
     }
 
     Ok(())

@@ -5,6 +5,12 @@ use std::process::Command;
 pub use git_surgeon::diff::{check_supported, parse_diff};
 pub use git_surgeon::hunk_id::assign_ids;
 
+/// True if a diff-side path is the /dev/null marker (file added or deleted).
+/// `parse_diff` strips the leading slash, so match both spellings.
+pub fn is_dev_null(path: &str) -> bool {
+    path == "/dev/null" || path == "dev/null"
+}
+
 /// Get the jj workspace root directory.
 pub fn get_repo_root() -> Result<std::path::PathBuf> {
     let output = Command::new("jj")
