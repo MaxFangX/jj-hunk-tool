@@ -36,7 +36,7 @@ fn format_hunk_display(hunk: &DiffHunk, color: bool) -> String {
     let mut out = String::new();
 
     // Parse old/new start lines from @@ header
-    let (old_start, new_start) = parse_header_ranges(&hunk.header);
+    let (old_start, new_start) = parse_header_starts(&hunk.header).unwrap_or((1, 1));
 
     // Set up syntax highlighting
     let ss = &*SYNTAX_SET;
@@ -138,43 +138,13 @@ fn format_hunk_display(hunk: &DiffHunk, color: bool) -> String {
     out
 }
 
-/// Parse both old and new start lines from a @@ header.
-/// "@@ -old_start,count +new_start,count @@" → (old_start, new_start)
-fn parse_header_ranges(header: &str) -> (usize, usize) {
-    let header = header.trim();
-    let after_at = match header.strip_prefix("@@ -") {
-        Some(s) => s,
-        None => return (1, 1),
-    };
-
-    // Parse old range
-    let old_end = after_at.find(' ').unwrap_or(after_at.len());
-    let old_range_str = &after_at[..old_end];
-    let old_start = old_range_str
-        .split_once(',')
-        .map(|(s, _)| s)
-        .unwrap_or(old_range_str)
-        .parse::<usize>()
-        .unwrap_or(1);
-
-    // Parse new range (after "+")
-    let rest = &after_at[old_end..];
-    let new_start = rest
-        .find('+')
-        .and_then(|pos| {
-            let after_plus = &rest[pos + 1..];
-            let end = after_plus.find(' ').unwrap_or(after_plus.len());
-            let new_range_str = &after_plus[..end];
-            new_range_str
-                .split_once(',')
-                .map(|(s, _)| s)
-                .unwrap_or(new_range_str)
-                .parse::<usize>()
-                .ok()
-        })
-        .unwrap_or(1);
-
-    (old_start, new_start)
+/// Parse the old and new start lines from a @@ header.
+/// "@@ -old_start,count +new_start,count @@..." → (old_start, new_start)
+fn parse_header_starts(header: &str) -> Option<(usize, usize)> {
+    let ranges = header.trim().strip_prefix("@@ -")?.split(" @@").next()?;
+    let (old, new) = ranges.split_once(" +")?;
+    let start = |range: &str| range.split(',').next()?.parse::<usize>().ok();
+    Some((start(old)?, start(new)?))
 }
 
 /// A hunk spec: (hunk_id, hunk, line_ranges).
@@ -486,7 +456,7 @@ pub struct HunkRouting {
 
 /// Absorb hunks into ancestor commits based on annotation overlap.
 pub fn absorb_hunks(
-    selected: &[&(String, &DiffHunk)],
+    selected: &[(&str, &DiffHunk)],
     source: &str,
     dry_run: bool,
     interactive: bool,
@@ -608,7 +578,7 @@ pub fn absorb_hunks(
         if crate::diff::is_dev_null(&hunk.old_file) {
             routings.push((
                 HunkRouting {
-                    hunk_id: id.clone(),
+                    hunk_id: id.to_string(),
                     file: hunk.file.clone(),
                     additions,
                     deletions,
@@ -634,7 +604,7 @@ pub fn absorb_hunks(
                 }
                 routings.push((
                     HunkRouting {
-                        hunk_id: id.clone(),
+                        hunk_id: id.to_string(),
                         file: hunk.file.clone(),
                         additions,
                         deletions,
@@ -648,17 +618,14 @@ pub fn absorb_hunks(
             }
         };
 
-        // Parse the @@ header to get old-side line range
-        let old_range = parse_old_range(&hunk.header);
-
         // Collect mutable ancestor change IDs from the hunk's changed lines.
         let mut ancestor_hits: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
 
-        if let Some((old_start, _old_count)) = old_range {
+        if let Some((old_start, _)) = parse_header_starts(&hunk.header) {
             if debug {
                 eprintln!(
-                    "debug: hunk {id} ({file}): old_range starts at line {old_start}, \
+                    "debug: hunk {id} ({file}): old range starts at line {old_start}, \
                      annotation has {} lines",
                     annotations.len(),
                     file = hunk.file,
@@ -702,7 +669,7 @@ pub fn absorb_hunks(
             }
         } else if debug {
             eprintln!(
-                "debug: hunk {id} ({file}): failed to parse old_range from header: {:?}",
+                "debug: hunk {id} ({file}): failed to parse header: {:?}",
                 hunk.header,
                 file = hunk.file,
             );
@@ -735,7 +702,7 @@ pub fn absorb_hunks(
 
         routings.push((
             HunkRouting {
-                hunk_id: id.clone(),
+                hunk_id: id.to_string(),
                 file: hunk.file.clone(),
                 additions,
                 deletions,
@@ -1095,86 +1062,36 @@ pub fn absorb_hunks(
     Ok(())
 }
 
-/// Parse the old-side range from a @@ header.
-/// Returns (start_line, count) from "@@ -start,count ..."
-fn parse_old_range(header: &str) -> Option<(usize, usize)> {
-    // Format: "@@ -start,count +start,count @@" or "@@ -start +start,count @@"
-    let header = header.trim();
-    let after_at = header.strip_prefix("@@ -")?;
-    let end = after_at.find(' ')?;
-    let range_str = &after_at[..end];
-    if let Some((start_s, count_s)) = range_str.split_once(',') {
-        let start: usize = start_s.parse().ok()?;
-        let count: usize = count_s.parse().ok()?;
-        Some((start, count))
-    } else {
-        let start: usize = range_str.parse().ok()?;
-        Some((start, 1))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_old_range_with_count() {
+    fn parse_header_starts_same() {
+        assert_eq!(parse_header_starts("@@ -7,3 +7,4 @@"), Some((7, 7)));
+    }
+
+    #[test]
+    fn parse_header_starts_different() {
+        assert_eq!(parse_header_starts("@@ -10,5 +12,3 @@"), Some((10, 12)));
+    }
+
+    #[test]
+    fn parse_header_starts_with_context_label() {
         assert_eq!(
-            parse_old_range("@@ -1,3 +1,3 @@"),
-            Some((1, 3))
+            parse_header_starts("@@ -1,3 +1,3 @@ fn main()"),
+            Some((1, 1))
         );
     }
 
     #[test]
-    fn parse_old_range_without_count() {
-        assert_eq!(
-            parse_old_range("@@ -5 +5,2 @@"),
-            Some((5, 1))
-        );
+    fn parse_header_starts_no_count() {
+        assert_eq!(parse_header_starts("@@ -5 +5,2 @@"), Some((5, 5)));
     }
 
     #[test]
-    fn parse_old_range_zero_count() {
-        assert_eq!(
-            parse_old_range("@@ -10,0 +10,3 @@"),
-            Some((10, 0))
-        );
-    }
-
-    #[test]
-    fn parse_old_range_with_context() {
-        assert_eq!(
-            parse_old_range("@@ -1,3 +1,3 @@ fn main()"),
-            Some((1, 3))
-        );
-    }
-
-    #[test]
-    fn parse_old_range_invalid() {
-        assert_eq!(parse_old_range("not a header"), None);
-    }
-
-    #[test]
-    fn parse_header_ranges_both() {
-        assert_eq!(parse_header_ranges("@@ -7,3 +7,4 @@"), (7, 7));
-    }
-
-    #[test]
-    fn parse_header_ranges_different_starts() {
-        assert_eq!(parse_header_ranges("@@ -10,5 +12,3 @@"), (10, 12));
-    }
-
-    #[test]
-    fn parse_header_ranges_with_context_label() {
-        assert_eq!(
-            parse_header_ranges("@@ -1,3 +1,3 @@ fn main()"),
-            (1, 1)
-        );
-    }
-
-    #[test]
-    fn parse_header_ranges_no_count() {
-        assert_eq!(parse_header_ranges("@@ -5 +5,2 @@"), (5, 5));
+    fn parse_header_starts_invalid() {
+        assert_eq!(parse_header_starts("not a header"), None);
     }
 
     #[test]

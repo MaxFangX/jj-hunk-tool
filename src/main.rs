@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use diff::{assign_ids, get_jj_diff, parse_diff};
+use tool::HunkSpec;
 
 #[derive(Parser)]
 #[command(name = "jj-hunk-tool", version, about = "Hunk-level operations for jj")]
@@ -252,18 +253,9 @@ fn main() -> Result<()> {
             let identified = assign_ids(&hunks);
             let specs = resolve_hunk_specs(&hunk_ids, &identified)?;
             let mut extra_args: Vec<String> = Vec::new();
-            for rev in &onto {
-                extra_args.push("-o".into());
-                extra_args.push(rev.clone());
-            }
-            for rev in &insert_after {
-                extra_args.push("-A".into());
-                extra_args.push(rev.clone());
-            }
-            for rev in &insert_before {
-                extra_args.push("-B".into());
-                extra_args.push(rev.clone());
-            }
+            push_rev_args(&mut extra_args, "-o", &onto);
+            push_rev_args(&mut extra_args, "-A", &insert_after);
+            push_rev_args(&mut extra_args, "-B", &insert_before);
             let extra_refs: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
             tool::split_hunks(
                 &specs,
@@ -324,18 +316,9 @@ fn main() -> Result<()> {
             if keep_emptied {
                 extra_args.push("-k".into());
             }
-            for rev in &onto {
-                extra_args.push("-o".into());
-                extra_args.push(rev.clone());
-            }
-            for rev in &insert_after {
-                extra_args.push("-A".into());
-                extra_args.push(rev.clone());
-            }
-            for rev in &insert_before {
-                extra_args.push("-B".into());
-                extra_args.push(rev.clone());
-            }
+            push_rev_args(&mut extra_args, "-o", &onto);
+            push_rev_args(&mut extra_args, "-A", &insert_after);
+            push_rev_args(&mut extra_args, "-B", &insert_before);
             let extra_refs: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
             tool::squash_hunks(&specs, &extra_refs, debug)?;
         }
@@ -346,27 +329,23 @@ fn main() -> Result<()> {
             to,
             restore_descendants,
         } => {
-            let (raw, jj_args) = if from.is_some() || to.is_some() {
+            let (raw, mut jj_args) = if from.is_some() || to.is_some() {
                 let f = from.as_deref().unwrap_or("@");
                 let t = to.as_deref().unwrap_or("@");
                 let raw = diff::get_jj_diff_from_to(f, t, debug)?;
-                let mut args = vec![
+                let args = vec![
                     "--from".to_string(), f.to_string(),
                     "--to".to_string(), t.to_string(),
                 ];
-                if restore_descendants {
-                    args.push("--restore-descendants".into());
-                }
                 (raw, args)
             } else {
                 let rev = revision.as_deref().unwrap_or("@");
                 let raw = get_jj_diff(&Some(rev.to_string()), debug)?;
-                let mut args = vec!["-r".to_string(), rev.to_string()];
-                if restore_descendants {
-                    args.push("--restore-descendants".into());
-                }
-                (raw, args)
+                (raw, vec!["-r".to_string(), rev.to_string()])
             };
+            if restore_descendants {
+                jj_args.push("--restore-descendants".into());
+            }
             let hunks = parse_diff(&raw);
             let identified = assign_ids(&hunks);
             let specs = resolve_hunk_specs(&hunk_ids, &identified)?;
@@ -381,32 +360,24 @@ fn main() -> Result<()> {
             restore_descendants,
         } => {
             // Determine which diff to inspect and what jj args to use.
-            // Default (no flags) = --changes-in @
-            let (raw, jj_args) = if let Some(ref ci) = changes_in {
-                let raw = get_jj_diff(&Some(ci.clone()), debug)?;
-                let mut args = vec!["--changes-in".to_string(), ci.clone()];
-                if restore_descendants {
-                    args.push("--restore-descendants".into());
-                }
-                (raw, args)
-            } else if from.is_some() || into.is_some() {
+            // --changes-in takes precedence; default (no flags) = --changes-in @
+            let (raw, mut jj_args) = if changes_in.is_none() && (from.is_some() || into.is_some()) {
                 let f = from.as_deref().unwrap_or("@");
                 let t = into.as_deref().unwrap_or("@");
                 let raw = diff::get_jj_diff_from_to(f, t, debug)?;
-                let mut args = vec!["--from".to_string(), f.to_string(), "--into".to_string(), t.to_string()];
-                if restore_descendants {
-                    args.push("--restore-descendants".into());
-                }
+                let args = vec![
+                    "--from".to_string(), f.to_string(),
+                    "--into".to_string(), t.to_string(),
+                ];
                 (raw, args)
             } else {
-                // Default: --changes-in @
-                let raw = get_jj_diff(&Some("@".to_string()), debug)?;
-                let mut args = vec!["--changes-in".to_string(), "@".to_string()];
-                if restore_descendants {
-                    args.push("--restore-descendants".into());
-                }
-                (raw, args)
+                let ci = changes_in.as_deref().unwrap_or("@");
+                let raw = get_jj_diff(&Some(ci.to_string()), debug)?;
+                (raw, vec!["--changes-in".to_string(), ci.to_string()])
             };
+            if restore_descendants {
+                jj_args.push("--restore-descendants".into());
+            }
             let hunks = parse_diff(&raw);
             let identified = assign_ids(&hunks);
             let specs = resolve_hunk_specs(&hunk_ids, &identified)?;
@@ -428,19 +399,14 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             // Filter to requested hunk IDs if provided
-            let selected: Vec<_> = if hunk_ids.is_empty() {
-                identified.iter().collect()
+            let selected: Vec<(&str, &git_surgeon::diff::DiffHunk)> = if hunk_ids.is_empty() {
+                identified.iter().map(|(id, hunk)| (id.as_str(), *hunk)).collect()
             } else {
-                let mut sel = Vec::new();
-                for raw_spec in &hunk_ids {
-                    let (id, _ranges) = parse_id_range(raw_spec)?;
-                    let entry = identified
-                        .iter()
-                        .find(|(hid, _)| hid == id)
-                        .ok_or_else(|| anyhow::anyhow!("hunk not found: {id}"))?;
-                    sel.push(entry);
+                let specs = resolve_hunk_specs(&hunk_ids, &identified)?;
+                if let Some((id, _, _)) = specs.iter().find(|(_, _, ranges)| !ranges.is_empty()) {
+                    anyhow::bail!("absorb does not support line ranges: {id}");
                 }
-                sel
+                specs.into_iter().map(|(id, hunk, _)| (id, hunk)).collect()
             };
             tool::absorb_hunks(&selected, source, dry_run, interactive, debug)?;
         }
@@ -452,7 +418,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-use tool::HunkSpec;
+/// Append `flag rev` pairs to jj args for a repeatable revision flag.
+fn push_rev_args(args: &mut Vec<String>, flag: &str, revs: &[String]) {
+    for rev in revs {
+        args.push(flag.into());
+        args.push(rev.clone());
+    }
+}
 
 /// Resolve hunk ID specs (with optional line ranges) against identified hunks.
 fn resolve_hunk_specs<'a>(
