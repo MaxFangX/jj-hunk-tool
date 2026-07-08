@@ -100,7 +100,8 @@ enum Command {
     },
     /// Rewrite hunks in a revision in-place (like jj diffedit, but with hunk IDs)
     Diffedit {
-        /// Hunk IDs to keep (all others are removed from the revision)
+        /// Hunk IDs to keep (all other hunks are removed from the revision;
+        /// changes without hunk IDs, e.g. binary files, are preserved)
         hunk_ids: Vec<String>,
         /// Revision to edit (default: @)
         #[arg(short, long)]
@@ -386,7 +387,7 @@ fn main() -> Result<()> {
             let identified = assign_ids(&hunks);
             let specs = resolve_hunk_specs(&hunk_ids, &identified)?;
             let jj_arg_refs: Vec<&str> = jj_args.iter().map(|s| s.as_str()).collect();
-            tool::diffedit_hunks(&specs, &jj_arg_refs, debug)?;
+            tool::diffedit_hunks(&identified, &specs, &jj_arg_refs, debug)?;
         }
         Command::Restore {
             hunk_ids,

@@ -37,6 +37,10 @@ impl TestRepo {
         std::fs::write(path, content).unwrap();
     }
 
+    fn write_bytes(&self, name: &str, content: &[u8]) {
+        std::fs::write(self.path().join(name), content).unwrap();
+    }
+
     fn read_file(&self, name: &str) -> String {
         std::fs::read_to_string(self.path().join(name)).unwrap()
     }
@@ -1067,6 +1071,157 @@ fn diffedit_invalid_id() {
 
     let err = repo.tool_err(&["diffedit", "invalid"]);
     assert!(err.contains("hunk not found"));
+}
+
+#[test]
+fn diffedit_preserves_binary_change() {
+    let repo = TestRepo::new();
+    repo.write_file("a.txt", "a\n");
+    repo.write_file("b.txt", "b\n");
+    repo.write_bytes("blob.bin", b"\x00\x01v1");
+    repo.jj(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", "a changed\n");
+    repo.write_file("b.txt", "b changed\n");
+    repo.write_bytes("blob.bin", b"\x00\x01v2");
+    repo.jj(&["commit", "-m", "change all"]);
+
+    // Keep a.txt's hunk; b.txt's hunk is removed, the binary change stays.
+    let a_id = repo.get_hunk_id_for_file("a.txt", &["-r", "@-"]);
+    repo.tool_ok(&["diffedit", &a_id, "-r", "@-"]);
+
+    let diff = repo.jj_diff("@-");
+    assert!(diff.contains("a.txt"), "kept hunk should remain");
+    assert!(!diff.contains("b.txt"), "unselected hunk should be removed");
+    assert!(diff.contains("blob.bin"), "binary change must be preserved");
+}
+
+#[test]
+fn diffedit_preserves_rename() {
+    let repo = TestRepo::new();
+    repo.write_file("a.txt", "a\n");
+    repo.write_file("b.txt", "b\n");
+    repo.write_file("oldname.txt", "rename me\n");
+    repo.jj(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", "a changed\n");
+    repo.write_file("b.txt", "b changed\n");
+    std::fs::rename(
+        repo.path().join("oldname.txt"),
+        repo.path().join("newname.txt"),
+    )
+    .unwrap();
+    repo.jj(&["commit", "-m", "change and rename"]);
+
+    let a_id = repo.get_hunk_id_for_file("a.txt", &["-r", "@-"]);
+    repo.tool_ok(&["diffedit", &a_id, "-r", "@-"]);
+
+    let diff = repo.jj_diff("@-");
+    assert!(diff.contains("a.txt"), "kept hunk should remain");
+    assert!(!diff.contains("b.txt"), "unselected hunk should be removed");
+    assert!(
+        diff.contains("rename from oldname.txt"),
+        "rename must be preserved: {diff}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn diffedit_rejects_unselected_mode_change_hunk() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repo = TestRepo::new();
+    repo.write_file("a.txt", "a\n");
+    repo.write_file("script.sh", "echo hi\n");
+    repo.jj(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", "a changed\n");
+    // chmod +x with a content change produces a hunk diffedit can't remove.
+    repo.write_file("script.sh", "echo hi\necho bye\n");
+    let script = repo.path().join("script.sh");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    repo.jj(&["commit", "-m", "change and chmod"]);
+
+    let a_id = repo.get_hunk_id_for_file("a.txt", &["-r", "@-"]);
+    let err = repo.tool_err(&["diffedit", &a_id, "-r", "@-"]);
+    assert!(
+        err.contains("mode") || err.contains("not supported"),
+        "should fail closed on mode change: {err}"
+    );
+
+    let diff = repo.jj_diff("@-");
+    assert!(
+        diff.contains("script.sh"),
+        "failed diffedit must not alter the revision: {diff}"
+    );
+}
+
+#[test]
+fn diffedit_keep_all_hunks_is_noop() {
+    let repo = TestRepo::new();
+    repo.commit_file("a.txt", "a\n");
+    repo.write_file("a.txt", "a changed\n");
+    repo.jj(&["commit", "-m", "change"]);
+
+    let before = repo.jj_diff("@-");
+    let id = repo.get_single_hunk_id(&["-r", "@-"]);
+    repo.tool_ok(&["diffedit", &id, "-r", "@-"]);
+
+    assert_eq!(repo.jj_diff("@-"), before, "keeping all hunks changes nothing");
+}
+
+#[test]
+fn diffedit_with_line_range() {
+    let repo = TestRepo::new();
+    repo.commit_file("a.txt", "line1\nline2\n");
+    repo.write_file("a.txt", "line1\nadded1\nline2\nadded2\n");
+    repo.jj(&["commit", "-m", "add two lines"]);
+
+    // Hunk lines: 1=" line1", 2="+added1", 3=" line2", 4="+added2".
+    let id = repo.get_single_hunk_id(&["-r", "@-"]);
+    repo.tool_ok(&["diffedit", &format!("{id}:2"), "-r", "@-"]);
+
+    let diff = repo.jj_diff("@-");
+    assert!(diff.contains("+added1"), "selected line kept: {diff}");
+    assert!(!diff.contains("+added2"), "unselected line removed: {diff}");
+}
+
+#[test]
+fn diffedit_removes_unselected_new_file() {
+    let repo = TestRepo::new();
+    repo.commit_file("a.txt", "a\n");
+    repo.write_file("a.txt", "a changed\n");
+    repo.write_file("brand_new.txt", "content\n");
+    repo.jj(&["commit", "-m", "change and add"]);
+
+    let a_id = repo.get_hunk_id_for_file("a.txt", &["-r", "@-"]);
+    repo.tool_ok(&["diffedit", &a_id, "-r", "@-"]);
+
+    let diff = repo.jj_diff("@-");
+    assert!(diff.contains("a.txt"), "kept hunk should remain");
+    assert!(
+        !diff.contains("brand_new.txt"),
+        "unselected new file should be removed: {diff}"
+    );
+}
+
+#[test]
+fn diffedit_removes_unselected_deleted_file() {
+    let repo = TestRepo::new();
+    repo.write_file("a.txt", "a\n");
+    repo.write_file("doomed.txt", "line1\nline2\n");
+    repo.jj(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", "a changed\n");
+    std::fs::remove_file(repo.path().join("doomed.txt")).unwrap();
+    repo.jj(&["commit", "-m", "change and delete"]);
+
+    // Keep a.txt's hunk; removing the deletion hunk restores doomed.txt.
+    let a_id = repo.get_hunk_id_for_file("a.txt", &["-r", "@-"]);
+    repo.tool_ok(&["diffedit", &a_id, "-r", "@-"]);
+
+    let diff = repo.jj_diff("@-");
+    assert!(diff.contains("a.txt"), "kept hunk should remain");
+    assert!(
+        !diff.contains("doomed.txt"),
+        "unselected deletion should be undone: {diff}"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

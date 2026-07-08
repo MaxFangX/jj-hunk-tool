@@ -14,6 +14,20 @@ use git_surgeon::diff::DiffHunk;
 
 const PATCH_ENV_VAR: &str = "JJ_HUNK_TOOL_PATCH";
 const REVERSE_ENV_VAR: &str = "JJ_HUNK_TOOL_REVERSE";
+const IN_PLACE_ENV_VAR: &str = "JJ_HUNK_TOOL_IN_PLACE";
+
+/// How the `_jj-tool` handler transforms the `$right` directory.
+#[derive(Clone, Copy)]
+enum ApplyMode {
+    /// Reset $right to $left, then apply the patch (split, squash, absorb).
+    Forward,
+    /// Reset $right to $left, then reverse-apply the patch (restore).
+    Reverse,
+    /// Apply the patch to $right as-is, without resetting (diffedit). Leaves
+    /// changes a text patch can't represent (binary files, renames, mode
+    /// changes) untouched instead of silently deleting them.
+    InPlace,
+}
 
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
@@ -169,24 +183,86 @@ fn parse_header_ranges(header: &str) -> (usize, usize) {
 pub type HunkSpec<'a> = (&'a str, &'a DiffHunk, Vec<(usize, usize)>);
 
 /// Build a combined patch from selected hunks with optional line ranges.
+/// With `reverse`, the patch *undoes* the selected changes when applied
+/// forward to the state that contains them.
 pub fn build_combined_patch(specs: &[HunkSpec<'_>], reverse: bool) -> Result<String> {
     let mut combined = String::new();
     for (id, hunk, ranges) in specs {
         git_surgeon::diff::check_supported(hunk, id)?;
-        let patched = if !ranges.is_empty() {
+        let mut patched = if !ranges.is_empty() {
             git_surgeon::patch::slice_hunk_multi(hunk, ranges, reverse)?
-        } else if reverse {
-            git_surgeon::patch::slice_hunk(hunk, 1, hunk.lines.len(), true)?
         } else {
             (*hunk).clone()
         };
+        if reverse {
+            patched = reverse_hunk(&patched);
+        }
         combined.push_str(&git_surgeon::patch::build_patch(&patched));
     }
     Ok(combined)
 }
 
+/// Flip a hunk so that applying it forward undoes the original change.
+fn reverse_hunk(hunk: &DiffHunk) -> DiffHunk {
+    let lines = hunk
+        .lines
+        .iter()
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix('+') {
+                format!("-{rest}")
+            } else if let Some(rest) = line.strip_prefix('-') {
+                format!("+{rest}")
+            } else {
+                line.clone()
+            }
+        })
+        .collect();
+
+    let old_side = if crate::diff::is_dev_null(&hunk.new_file) {
+        "--- /dev/null".to_string()
+    } else {
+        format!("--- a/{}", hunk.new_file)
+    };
+    let new_side = if crate::diff::is_dev_null(&hunk.old_file) {
+        "+++ /dev/null".to_string()
+    } else {
+        format!("+++ b/{}", hunk.old_file)
+    };
+
+    DiffHunk {
+        file: hunk.file.clone(),
+        old_file: hunk.new_file.clone(),
+        new_file: hunk.old_file.clone(),
+        file_header: format!("{old_side}\n{new_side}"),
+        header: reverse_header(&hunk.header),
+        lines,
+        unsupported_metadata: hunk.unsupported_metadata.clone(),
+    }
+}
+
+/// Swap the ranges in a @@ header: "@@ -a,b +c,d @@ ctx" → "@@ -c,d +a,b @@ ctx".
+fn reverse_header(header: &str) -> String {
+    let parts = header
+        .strip_prefix("@@ -")
+        .and_then(|rest| rest.split_once(" @@"))
+        .and_then(|(ranges, tail)| {
+            ranges
+                .split_once(" +")
+                .map(|(old, new)| (old, new, tail))
+        });
+    match parts {
+        Some((old, new, tail)) => format!("@@ -{new} +{old} @@{tail}"),
+        None => header.to_string(),
+    }
+}
+
 /// Run a jj command with our tool configured via inline --config flags.
-fn run_jj_with_tool(jj_args: &[&str], patch_content: &str, reverse: bool, debug: bool) -> Result<()> {
+fn run_jj_with_tool(
+    jj_args: &[&str],
+    patch_content: &str,
+    mode: ApplyMode,
+    debug: bool,
+) -> Result<()> {
     let exe = std::env::current_exe().context("finding own executable")?;
 
     let mut patch_file = tempfile::NamedTempFile::new().context("creating temp patch file")?;
@@ -206,14 +282,19 @@ fn run_jj_with_tool(jj_args: &[&str], patch_content: &str, reverse: bool, debug:
     cmd.args(["--config", config_edit_args]);
     cmd.args(["--tool", "jj-hunk-tool"]);
     cmd.env(PATCH_ENV_VAR, patch_file.path());
-    if reverse {
-        cmd.env(REVERSE_ENV_VAR, "1");
+    match mode {
+        ApplyMode::Forward => {}
+        ApplyMode::Reverse => {
+            cmd.env(REVERSE_ENV_VAR, "1");
+        }
+        ApplyMode::InPlace => {
+            cmd.env(IN_PLACE_ENV_VAR, "1");
+        }
     }
 
     if debug {
         eprintln!("debug: running jj {}", jj_args.join(" "));
         eprintln!("debug: patch content ({} bytes):\n{patch_content}", patch_content.len());
-        eprintln!("debug: reverse={reverse}");
         eprintln!("debug: patch file: {}", patch_file.path().display());
     }
 
@@ -263,7 +344,7 @@ pub fn split_hunks(
     }
     args.extend_from_slice(extra_args);
 
-    run_jj_with_tool(&args, &patch_content, false, debug)?;
+    run_jj_with_tool(&args, &patch_content, ApplyMode::Forward, debug)?;
     Ok(())
 }
 
@@ -275,18 +356,90 @@ pub fn squash_hunks(specs: &[HunkSpec<'_>], extra_args: &[&str], debug: bool) ->
     }
     let mut args = vec!["squash"];
     args.extend_from_slice(extra_args);
-    run_jj_with_tool(&args, &patch_content, false, debug)
+    run_jj_with_tool(&args, &patch_content, ApplyMode::Forward, debug)
 }
 
 /// Rewrite a revision in-place, keeping only the selected hunks.
-pub fn diffedit_hunks(specs: &[HunkSpec<'_>], jj_extra_args: &[&str], debug: bool) -> Result<()> {
-    let patch_content = build_combined_patch(specs, false)?;
-    if patch_content.is_empty() {
+///
+/// Rather than rebuilding the revision from its base — which would silently
+/// delete changes a text patch can't represent (binary files, renames, mode
+/// changes) — this removes the *unselected* hunks from the revision's current
+/// state. Unselected hunks that can't be removed (e.g. carrying a mode
+/// change) fail closed with an error.
+pub fn diffedit_hunks(
+    identified: &[(String, &DiffHunk)],
+    selected: &[HunkSpec<'_>],
+    jj_extra_args: &[&str],
+    debug: bool,
+) -> Result<()> {
+    if selected.is_empty() {
         bail!("no hunks selected");
+    }
+    let removal = complement_specs(identified, selected);
+    let patch_content =
+        build_combined_patch(&removal, true).context("cannot remove unselected hunk")?;
+    if patch_content.is_empty() {
+        println!("All hunks kept; revision unchanged.");
+        return Ok(());
     }
     let mut args = vec!["diffedit"];
     args.extend_from_slice(jj_extra_args);
-    run_jj_with_tool(&args, &patch_content, false, debug)
+    run_jj_with_tool(&args, &patch_content, ApplyMode::InPlace, debug)
+}
+
+/// Compute the complement of a hunk selection: specs covering every change in
+/// `identified` not covered by `selected`.
+fn complement_specs<'a>(
+    identified: &'a [(String, &'a DiffHunk)],
+    selected: &[HunkSpec<'a>],
+) -> Vec<HunkSpec<'a>> {
+    let mut result = Vec::new();
+    for (id, hunk) in identified {
+        // An empty range list selects the whole hunk.
+        let selected_ranges: Vec<&Vec<(usize, usize)>> = selected
+            .iter()
+            .filter(|(sid, _, _)| sid == id)
+            .map(|(_, _, ranges)| ranges)
+            .collect();
+        if selected_ranges.iter().any(|ranges| ranges.is_empty()) {
+            continue; // whole hunk kept
+        }
+        if selected_ranges.is_empty() {
+            result.push((id.as_str(), *hunk, Vec::new()));
+            continue;
+        }
+
+        let kept: Vec<(usize, usize)> =
+            selected_ranges.into_iter().flatten().copied().collect();
+        let complement = invert_ranges(&kept, hunk.lines.len());
+        let has_changes = hunk.lines.iter().enumerate().any(|(i, line)| {
+            (line.starts_with('+') || line.starts_with('-'))
+                && complement.iter().any(|&(s, e)| (s..=e).contains(&(i + 1)))
+        });
+        if has_changes {
+            result.push((id.as_str(), *hunk, complement));
+        }
+    }
+    result
+}
+
+/// Invert 1-based inclusive ranges over [1, len]. Ranges may be unsorted or
+/// overlapping; the result is sorted and disjoint.
+fn invert_ranges(ranges: &[(usize, usize)], len: usize) -> Vec<(usize, usize)> {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable();
+    let mut result = Vec::new();
+    let mut next = 1;
+    for (start, end) in sorted {
+        if start > next {
+            result.push((next, start - 1));
+        }
+        next = next.max(end + 1);
+    }
+    if next <= len {
+        result.push((next, len));
+    }
+    result
 }
 
 /// Restore (undo) selected hunks. The caller provides the jj-specific args
@@ -298,7 +451,7 @@ pub fn restore_hunks(specs: &[HunkSpec<'_>], jj_extra_args: &[&str], debug: bool
     }
     let mut args = vec!["restore"];
     args.extend_from_slice(jj_extra_args);
-    run_jj_with_tool(&args, &patch_content, true, debug)
+    run_jj_with_tool(&args, &patch_content, ApplyMode::Reverse, debug)
 }
 
 /// A hunk fingerprint for stable matching across re-computations.
@@ -939,7 +1092,7 @@ pub fn absorb_hunks(
         }
 
         let args: Vec<&str> = vec!["squash", "--from", source, "--into", target];
-        run_jj_with_tool(&args, &patch_content, false, debug)?;
+        run_jj_with_tool(&args, &patch_content, ApplyMode::Forward, debug)?;
     }
 
     println!("To undo, run: jj op restore {pre_op_id}");
@@ -1052,6 +1205,123 @@ mod tests {
         assert!(!output.contains(" 1:"), "should NOT have line 1: {output}");
     }
 
+    fn test_hunk(lines: &[&str]) -> DiffHunk {
+        DiffHunk {
+            file: "a.txt".into(),
+            old_file: "a.txt".into(),
+            new_file: "a.txt".into(),
+            file_header: "--- a/a.txt\n+++ b/a.txt".into(),
+            header: "@@ -1,3 +1,3 @@".into(),
+            lines: lines.iter().map(|l| l.to_string()).collect(),
+            unsupported_metadata: None,
+        }
+    }
+
+    #[test]
+    fn reverse_hunk_swaps_lines_and_sides() {
+        let hunk = test_hunk(&[" ctx", "-old", "+new"]);
+        let reversed = reverse_hunk(&hunk);
+        assert_eq!(reversed.lines, vec![" ctx", "+old", "-new"]);
+        assert_eq!(reversed.file_header, "--- a/a.txt\n+++ b/a.txt");
+    }
+
+    #[test]
+    fn reverse_hunk_creation_becomes_deletion() {
+        let mut hunk = test_hunk(&["+hello"]);
+        hunk.old_file = "dev/null".into();
+        hunk.file_header = "--- /dev/null\n+++ b/a.txt".into();
+        hunk.header = "@@ -0,0 +1,1 @@".into();
+
+        let reversed = reverse_hunk(&hunk);
+        assert_eq!(reversed.lines, vec!["-hello"]);
+        assert_eq!(reversed.file_header, "--- a/a.txt\n+++ /dev/null");
+        assert_eq!(reversed.header, "@@ -1,1 +0,0 @@");
+    }
+
+    #[test]
+    fn reverse_header_swaps_ranges() {
+        assert_eq!(reverse_header("@@ -1,3 +5,7 @@"), "@@ -5,7 +1,3 @@");
+        assert_eq!(
+            reverse_header("@@ -1,3 +1,4 @@ fn main()"),
+            "@@ -1,4 +1,3 @@ fn main()"
+        );
+        assert_eq!(reverse_header("@@ -5 +5,2 @@"), "@@ -5,2 +5 @@");
+    }
+
+    #[test]
+    fn invert_ranges_basic() {
+        assert_eq!(invert_ranges(&[(3, 5)], 10), vec![(1, 2), (6, 10)]);
+    }
+
+    #[test]
+    fn invert_ranges_full_coverage() {
+        assert_eq!(invert_ranges(&[(1, 10)], 10), vec![]);
+    }
+
+    #[test]
+    fn invert_ranges_empty_selection() {
+        assert_eq!(invert_ranges(&[], 10), vec![(1, 10)]);
+    }
+
+    #[test]
+    fn invert_ranges_unsorted_overlapping() {
+        assert_eq!(
+            invert_ranges(&[(6, 8), (2, 4), (3, 5)], 10),
+            vec![(1, 1), (9, 10)]
+        );
+    }
+
+    #[test]
+    fn invert_ranges_at_bounds() {
+        assert_eq!(invert_ranges(&[(1, 3), (8, 10)], 10), vec![(4, 7)]);
+    }
+
+    #[test]
+    fn complement_specs_unselected_hunk_included_whole() {
+        let h1 = test_hunk(&[" ctx", "-old", "+new"]);
+        let h2 = test_hunk(&[" ctx", "+added"]);
+        let identified = vec![("aaaaaaa".to_string(), &h1), ("bbbbbbb".to_string(), &h2)];
+        let selected: Vec<HunkSpec<'_>> = vec![("aaaaaaa", &h1, vec![])];
+
+        let complement = complement_specs(&identified, &selected);
+        assert_eq!(complement.len(), 1);
+        assert_eq!(complement[0].0, "bbbbbbb");
+        assert!(complement[0].2.is_empty(), "whole hunk, no ranges");
+    }
+
+    #[test]
+    fn complement_specs_partial_selection_inverts_ranges() {
+        let h = test_hunk(&[" ctx", "+one", "+two", " ctx2"]);
+        let identified = vec![("aaaaaaa".to_string(), &h)];
+        let selected: Vec<HunkSpec<'_>> = vec![("aaaaaaa", &h, vec![(2, 2)])];
+
+        let complement = complement_specs(&identified, &selected);
+        assert_eq!(complement.len(), 1);
+        assert_eq!(complement[0].2, vec![(1, 1), (3, 4)]);
+    }
+
+    #[test]
+    fn complement_specs_complement_without_changes_skipped() {
+        // Only line 2 is a change; selecting it leaves just context lines.
+        let h = test_hunk(&[" ctx", "+added", " ctx2"]);
+        let identified = vec![("aaaaaaa".to_string(), &h)];
+        let selected: Vec<HunkSpec<'_>> = vec![("aaaaaaa", &h, vec![(2, 2)])];
+
+        assert!(complement_specs(&identified, &selected).is_empty());
+    }
+
+    #[test]
+    fn complement_specs_multiple_specs_same_hunk_merged() {
+        let h = test_hunk(&["+one", "+two", "+three"]);
+        let identified = vec![("aaaaaaa".to_string(), &h)];
+        let selected: Vec<HunkSpec<'_>> =
+            vec![("aaaaaaa", &h, vec![(1, 1)]), ("aaaaaaa", &h, vec![(3, 3)])];
+
+        let complement = complement_specs(&identified, &selected);
+        assert_eq!(complement.len(), 1);
+        assert_eq!(complement[0].2, vec![(2, 2)]);
+    }
+
     #[test]
     fn fingerprint_ignores_context() {
         let hunk1 = DiffHunk {
@@ -1097,8 +1367,10 @@ mod tests {
 ///
 /// Algorithm:
 /// 1. Read patch path from JJ_HUNK_TOOL_PATCH env var
-/// 2. Reset $right to match $left (copy all files from left, remove extras)
-/// 3. Apply the patch to $right
+/// 2. Reset $right to match $left (copy all files from left, remove extras),
+///    unless JJ_HUNK_TOOL_IN_PLACE is set
+/// 3. Apply the patch to $right (in reverse if JJ_HUNK_TOOL_REVERSE is set)
+/// 4. Remove files the patch marked as deleted (patch only empties them)
 pub fn jj_tool_apply(left: &str, right: &str) -> Result<()> {
     let patch_path = std::env::var(PATCH_ENV_VAR)
         .with_context(|| format!("{PATCH_ENV_VAR} environment variable not set"))?;
@@ -1106,8 +1378,11 @@ pub fn jj_tool_apply(left: &str, right: &str) -> Result<()> {
     let left_path = Path::new(left);
     let right_path = Path::new(right);
 
-    // Step 1: Reset $right to $left state
-    reset_dir_to(left_path, right_path)?;
+    // Step 1: Reset $right to $left state. In-place mode skips this so that
+    // changes the patch can't represent (binary files, renames) survive.
+    if std::env::var(IN_PLACE_ENV_VAR).is_err() {
+        reset_dir_to(left_path, right_path)?;
+    }
 
     // Step 2: Apply the pre-computed patch. Close stdin so patch fails
     // instead of prompting when it can't resolve a filename.
