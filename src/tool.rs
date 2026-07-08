@@ -370,7 +370,7 @@ pub fn absorb_hunks(
     let unique_files: Vec<String> = {
         let mut files = std::collections::HashSet::new();
         for (_, hunk) in selected {
-            if hunk.old_file != "/dev/null" {
+            if !crate::diff::is_dev_null(&hunk.old_file) {
                 files.insert(hunk.file.clone());
             }
         }
@@ -457,7 +457,7 @@ pub fn absorb_hunks(
         let fingerprint = HunkFingerprint::from_hunk(hunk);
 
         // New files can't be annotated
-        if hunk.old_file == "/dev/null" {
+        if crate::diff::is_dev_null(&hunk.old_file) {
             routings.push((
                 HunkRouting {
                     hunk_id: id.clone(),
@@ -569,7 +569,7 @@ pub fn absorb_hunks(
             (Some(target), vec![], "matched")
         } else if ancestor_hits.is_empty() {
             // Fallback: find the most recent mutable ancestor that touched this file
-            if hunk.old_file != "/dev/null" {
+            if !crate::diff::is_dev_null(&hunk.old_file) {
                 match file_ancestors_cache.get(&hunk.file) {
                     Some(file_ancestors) if !file_ancestors.is_empty() => {
                         let target = file_ancestors[0].clone();

@@ -1628,6 +1628,23 @@ fn absorb_new_file_stays_in_working_copy() {
 }
 
 #[test]
+fn absorb_new_file_routed_as_new_file() {
+    let repo = TestRepo::new();
+    repo.commit_file("existing.txt", "content\n");
+    repo.write_file("brand_new.txt", "new file content\n");
+
+    let (stdout, stderr) = repo.tool_output(&["absorb", "--dry-run"]);
+    assert!(
+        stdout.contains("new file"),
+        "new file should be reported as such, got: {stdout}"
+    );
+    assert!(
+        !stderr.contains("annotation failed"),
+        "new file should not be annotated, got: {stderr}"
+    );
+}
+
+#[test]
 fn absorb_pure_insertion_falls_back_to_file() {
     let repo = TestRepo::new();
     // Base file with content
