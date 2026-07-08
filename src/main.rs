@@ -1,6 +1,4 @@
 mod diff;
-mod hunk_id;
-mod patch;
 mod tool;
 
 use anyhow::Result;
