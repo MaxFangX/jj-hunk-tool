@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
@@ -464,17 +465,17 @@ pub fn absorb_hunks(
 ) -> Result<()> {
     use crate::diff;
 
-    // 1. Get mutable ancestors and repo root in parallel
+    // Fetch mutable ancestors and repo root in parallel
     let (ancestors_result, repo_root_result) = std::thread::scope(|s| {
         let anc = s.spawn(|| diff::get_mutable_ancestors_with_descriptions(source));
-        let root = s.spawn(|| diff::get_repo_root());
+        let root = s.spawn(diff::get_repo_root);
         (anc.join().unwrap(), root.join().unwrap())
     });
     let (ancestors, ancestor_descs) = ancestors_result?;
     let repo_root = repo_root_result?;
 
     if debug {
-        eprintln!("debug: mutable ancestors: {:?}", ancestors);
+        eprintln!("debug: mutable ancestors: {ancestors:?}");
     }
 
     if ancestors.is_empty() {
@@ -482,41 +483,101 @@ pub fn absorb_hunks(
         return Ok(());
     }
 
-    // 2. Pre-fetch annotations and file-ancestor data in parallel
+    let caches = fetch_absorb_caches(selected, source, &repo_root, debug);
+
+    let mut routings: Vec<(HunkRouting, HunkFingerprint)> = selected
+        .iter()
+        .map(|(id, hunk)| {
+            (
+                route_hunk(id, hunk, &ancestors, &caches, debug),
+                HunkFingerprint::from_hunk(hunk),
+            )
+        })
+        .collect();
+
+    if interactive {
+        interactive_review(&mut routings, selected, &ancestors, &ancestor_descs)?;
+    }
+
+    // Print the routing plan
+    let routing_refs = || routings.iter().map(|(r, _)| r);
+    let absorbed: Vec<&HunkRouting> = routing_refs().filter(|r| r.target.is_some()).collect();
+    let ambiguous: Vec<&HunkRouting> = routing_refs().filter(|r| r.reason == "ambiguous").collect();
+    let unmatched: Vec<&HunkRouting> = routing_refs()
+        .filter(|r| r.target.is_none() && r.reason != "ambiguous")
+        .collect();
+
+    if absorbed.is_empty() {
+        println!("Nothing to absorb: no hunks matched any ancestor.");
+        print_leftovers(&ambiguous, &unmatched, source, &ancestor_descs);
+        return Ok(());
+    }
+
+    let verb = if dry_run { "Would absorb" } else { "Absorbed" };
+    println!("{verb} {} hunk(s):", absorbed.len());
+    for r in &absorbed {
+        let target = r.target.as_ref().unwrap();
+        println!(
+            "  {} ({} +{} -{}) → {}",
+            r.hunk_id,
+            r.file,
+            r.additions,
+            r.deletions,
+            describe_change(target, &ancestor_descs),
+        );
+    }
+    print_leftovers(&ambiguous, &unmatched, source, &ancestor_descs);
+
+    if dry_run {
+        return Ok(());
+    }
+
+    execute_absorb(&routings, source, debug)
+}
+
+/// Per-file data prefetched in parallel for hunk routing.
+struct AbsorbCaches {
+    /// Change ID per line of each file at the parent revision.
+    annotations: HashMap<String, Vec<String>>,
+    /// Mutable ancestors touching each file, most recent first.
+    file_ancestors: HashMap<String, Vec<String>>,
+}
+
+fn fetch_absorb_caches(
+    selected: &[(&str, &DiffHunk)],
+    source: &str,
+    repo_root: &Path,
+    debug: bool,
+) -> AbsorbCaches {
+    use crate::diff;
+
     let parent_rev = format!("{source}-");
+    let unique_files: HashSet<&str> = selected
+        .iter()
+        .filter(|(_, hunk)| !diff::is_dev_null(&hunk.old_file))
+        .map(|(_, hunk)| hunk.file.as_str())
+        .collect();
 
-    let unique_files: Vec<String> = {
-        let mut files = std::collections::HashSet::new();
-        for (_, hunk) in selected {
-            if !crate::diff::is_dev_null(&hunk.old_file) {
-                files.insert(hunk.file.clone());
-            }
-        }
-        files.into_iter().collect()
-    };
-
-    let (annotations_cache, file_ancestors_cache) = std::thread::scope(|s| {
+    std::thread::scope(|s| {
         let ann_handles: Vec<_> = unique_files
             .iter()
-            .map(|file| {
+            .map(|&file| {
                 let pr = &parent_rev;
-                let root = &repo_root;
                 if debug {
                     eprintln!("debug: annotating {file} at revision {pr}");
                 }
-                s.spawn(move || (file.clone(), diff::get_jj_annotations(pr, file, root)))
+                s.spawn(move || (file, diff::get_jj_annotations(pr, file, repo_root)))
             })
             .collect();
 
         let fa_handles: Vec<_> = unique_files
             .iter()
-            .map(|file| {
-                let root = &repo_root;
-                s.spawn(move || (file.clone(), diff::get_ancestors_touching_file(source, file, root)))
+            .map(|&file| {
+                s.spawn(move || (file, diff::get_ancestors_touching_file(source, file, repo_root)))
             })
             .collect();
 
-        let annotations: std::collections::HashMap<String, Vec<String>> = ann_handles
+        let annotations = ann_handles
             .into_iter()
             .filter_map(|h| {
                 let (f, r) = h.join().ok()?;
@@ -528,7 +589,7 @@ pub fn absorb_hunks(
                                 eprintln!("debug:   line {}: {change_id}", i + 1);
                             }
                         }
-                        Some((f, a))
+                        Some((f.to_string(), a))
                     }
                     Err(e) => {
                         eprintln!("warning: annotation failed for {f}: {e}");
@@ -541,7 +602,7 @@ pub fn absorb_hunks(
             })
             .collect();
 
-        let file_ancestors: std::collections::HashMap<String, Vec<String>> = fa_handles
+        let file_ancestors = fa_handles
             .into_iter()
             .filter_map(|h| {
                 let (f, r) = h.join().ok()?;
@@ -550,7 +611,7 @@ pub fn absorb_hunks(
                         if debug {
                             eprintln!("debug: file ancestors for {f}: {a:?}");
                         }
-                        Some((f, a))
+                        Some((f.to_string(), a))
                     }
                     Err(e) => {
                         eprintln!("warning: file ancestor lookup failed for {f}: {e}");
@@ -563,457 +624,373 @@ pub fn absorb_hunks(
             })
             .collect();
 
-        (annotations, file_ancestors)
-    });
-
-    // 3. Route each hunk
-    let mut routings: Vec<(HunkRouting, HunkFingerprint)> = Vec::new();
-
-    for (id, hunk) in selected {
-        let additions = hunk.lines.iter().filter(|l| l.starts_with('+')).count();
-        let deletions = hunk.lines.iter().filter(|l| l.starts_with('-')).count();
-        let fingerprint = HunkFingerprint::from_hunk(hunk);
-
-        // New files can't be annotated
-        if crate::diff::is_dev_null(&hunk.old_file) {
-            routings.push((
-                HunkRouting {
-                    hunk_id: id.to_string(),
-                    file: hunk.file.clone(),
-                    additions,
-                    deletions,
-                    target: None,
-                    candidates: vec![],
-                    reason: "new file",
-                },
-                fingerprint,
-            ));
-            continue;
+        AbsorbCaches {
+            annotations,
+            file_ancestors,
         }
+    })
+}
 
-        // Get annotations for this file (from pre-fetched cache)
-        let annotations = match annotations_cache.get(&hunk.file) {
-            Some(ann) => ann,
-            None => {
-                if debug {
-                    eprintln!(
-                        "debug: hunk {id} ({file}): no annotations in cache \
-                         (annotation command likely failed, see warning above)",
-                        file = hunk.file,
-                    );
-                }
-                routings.push((
-                    HunkRouting {
-                        hunk_id: id.to_string(),
-                        file: hunk.file.clone(),
-                        additions,
-                        deletions,
-                        target: None,
-                        candidates: vec![],
-                        reason: "annotation failed",
-                    },
-                    fingerprint,
-                ));
-                continue;
-            }
-        };
+/// Route one hunk to the ancestor commit that introduced the lines it touches.
+fn route_hunk(
+    id: &str,
+    hunk: &DiffHunk,
+    ancestors: &HashSet<String>,
+    caches: &AbsorbCaches,
+    debug: bool,
+) -> HunkRouting {
+    let route = |target: Option<String>, candidates: Vec<String>, reason: &'static str| {
+        HunkRouting {
+            hunk_id: id.to_string(),
+            file: hunk.file.clone(),
+            additions: hunk.lines.iter().filter(|l| l.starts_with('+')).count(),
+            deletions: hunk.lines.iter().filter(|l| l.starts_with('-')).count(),
+            target,
+            candidates,
+            reason,
+        }
+    };
 
-        // Collect mutable ancestor change IDs from the hunk's changed lines.
-        let mut ancestor_hits: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+    // New files can't be annotated
+    if crate::diff::is_dev_null(&hunk.old_file) {
+        return route(None, vec![], "new file");
+    }
 
-        if let Some((old_start, _)) = parse_header_starts(&hunk.header) {
-            if debug {
-                eprintln!(
-                    "debug: hunk {id} ({file}): old range starts at line {old_start}, \
-                     annotation has {} lines",
-                    annotations.len(),
-                    file = hunk.file,
-                );
+    let Some(annotations) = caches.annotations.get(&hunk.file) else {
+        if debug {
+            eprintln!(
+                "debug: hunk {id} ({file}): no annotations in cache \
+                 (annotation command likely failed, see warning above)",
+                file = hunk.file,
+            );
+        }
+        return route(None, vec![], "annotation failed");
+    };
+
+    let ancestor_hits = count_ancestor_hits(id, hunk, annotations, ancestors, debug);
+    if debug {
+        eprintln!("debug: hunk {id}: ancestor_hits = {ancestor_hits:?}");
+    }
+
+    if ancestor_hits.len() == 1 {
+        let target = ancestor_hits.into_keys().next().unwrap();
+        route(Some(target), vec![], "matched")
+    } else if ancestor_hits.is_empty() {
+        // Fallback: the most recent mutable ancestor that touched this file
+        match caches.file_ancestors.get(&hunk.file) {
+            Some(file_ancestors) if !file_ancestors.is_empty() => {
+                route(Some(file_ancestors[0].clone()), vec![], "matched (file)")
             }
-            let has_deletions = hunk.lines.iter().any(|l| l.starts_with('-'));
-            if has_deletions {
-                let mut old_line = old_start; // 1-based
-                for line in &hunk.lines {
-                    if line.starts_with('-') {
-                        let ann_idx = old_line.saturating_sub(1);
-                        if let Some(change_id) = annotations.get(ann_idx) {
-                            let is_mutable = ancestors.contains(change_id);
-                            if debug {
-                                eprintln!(
-                                    "debug: hunk {id}: deleted line {old_line} -> \
-                                     change {change_id} (mutable: {is_mutable})"
-                                );
-                            }
-                            if is_mutable {
-                                *ancestor_hits.entry(change_id.clone()).or_insert(0) += 1;
-                            }
-                        } else if debug {
-                            eprintln!(
-                                "debug: hunk {id}: deleted line {old_line} -> \
-                                 annotation index {ann_idx} out of bounds \
-                                 (annotations len: {})",
-                                annotations.len()
-                            );
-                        }
-                        old_line += 1;
-                    } else if line.starts_with('+') {
-                        // Addition: doesn't consume an old line
-                    } else {
-                        // Context line: consumes an old line but don't count it
-                        old_line += 1;
-                    }
-                }
-            } else if debug {
-                eprintln!("debug: hunk {id}: no deletions, skipping line-level annotation");
-            }
-        } else if debug {
+            _ => route(None, vec![], "no overlapping ancestor hunk"),
+        }
+    } else {
+        route(None, ancestor_hits.into_keys().collect(), "ambiguous")
+    }
+}
+
+/// Count, per mutable ancestor, how many of the hunk's deleted lines it
+/// introduced (per `jj file annotate` of the parent revision).
+fn count_ancestor_hits(
+    id: &str,
+    hunk: &DiffHunk,
+    annotations: &[String],
+    ancestors: &HashSet<String>,
+    debug: bool,
+) -> HashMap<String, usize> {
+    let mut hits = HashMap::new();
+
+    let Some((old_start, _)) = parse_header_starts(&hunk.header) else {
+        if debug {
             eprintln!(
                 "debug: hunk {id} ({file}): failed to parse header: {:?}",
                 hunk.header,
                 file = hunk.file,
             );
         }
-
-        if debug {
-            eprintln!("debug: hunk {id}: ancestor_hits = {ancestor_hits:?}");
-        }
-
-        let (target, candidates, reason) = if ancestor_hits.len() == 1 {
-            let target = ancestor_hits.into_keys().next().unwrap();
-            (Some(target), vec![], "matched")
-        } else if ancestor_hits.is_empty() {
-            // Fallback: find the most recent mutable ancestor that touched this file
-            if !crate::diff::is_dev_null(&hunk.old_file) {
-                match file_ancestors_cache.get(&hunk.file) {
-                    Some(file_ancestors) if !file_ancestors.is_empty() => {
-                        let target = file_ancestors[0].clone();
-                        (Some(target), vec![], "matched (file)")
-                    }
-                    _ => (None, vec![], "no overlapping ancestor hunk"),
-                }
-            } else {
-                (None, vec![], "no overlapping ancestor hunk")
-            }
-        } else {
-            let candidates: Vec<String> = ancestor_hits.into_keys().collect();
-            (None, candidates, "ambiguous")
-        };
-
-        routings.push((
-            HunkRouting {
-                hunk_id: id.to_string(),
-                file: hunk.file.clone(),
-                additions,
-                deletions,
-                target,
-                candidates,
-                reason,
-            },
-            fingerprint,
-        ));
-    }
-
-    // 3b. Interactive review: let user accept/skip/retarget each hunk
-    if interactive {
-        let ancestor_list: Vec<String> = ancestors.iter().cloned().collect();
-        let mut quit = false;
-        let mut skip_file: Option<String> = None;
-        let mut absorb_file: Option<String> = None;
-
-        // Read single chars: use console::Term for TTY, raw bytes for piped stdin
-        let term = console::Term::stdout();
-        let is_tty = term.is_term();
-
-        let read_char = |term: &console::Term, is_tty: bool| -> Result<char> {
-            if is_tty {
-                Ok(term.read_char()?)
-            } else {
-                use std::io::Read;
-                let mut buf = [0u8; 1];
-                let n = std::io::stdin().lock().read(&mut buf)?;
-                if n == 0 {
-                    bail!("unexpected end of input");
-                }
-                Ok(buf[0] as char)
-            }
-        };
-
-        for (routing, _fp) in routings.iter_mut() {
-            if quit {
-                routing.target = None;
-                routing.reason = "skipped (quit)";
-                continue;
-            }
-
-            if let Some(ref sf) = skip_file {
-                if routing.file == *sf {
-                    routing.target = None;
-                    routing.reason = "skipped (file)";
-                    continue;
-                } else {
-                    skip_file = None;
-                }
-            }
-
-            if let Some(ref af) = absorb_file {
-                if routing.file == *af {
-                    // Auto-absorb: keep existing target (if any)
-                    continue;
-                } else {
-                    absorb_file = None;
-                }
-            }
-
-            // Find the original hunk to display its content
-            let hunk_opt = selected
-                .iter()
-                .find(|(id, _)| *id == routing.hunk_id)
-                .map(|(_, h)| *h);
-
-            // Display hunk with syntax highlighting and absolute line numbers
-            let header_style = if is_tty { Style::new().bold() } else { Style::new() };
-            println!(
-                "\n{} {} (+{} -{})",
-                header_style.apply_to(&routing.hunk_id),
-                header_style.apply_to(&routing.file),
-                routing.additions,
-                routing.deletions,
-            );
-            if let Some(hunk) = hunk_opt {
-                print!("{}", format_hunk_display(hunk, is_tty));
-            }
-
-            // Show current target
-            let target_desc = if let Some(ref t) = routing.target {
-                let desc = ancestor_descs.get(t).cloned().unwrap_or_default();
-                if desc.is_empty() {
-                    format!("Target: {t}")
-                } else {
-                    format!("Target: {t} ({desc})")
-                }
-            } else if routing.reason == "ambiguous" {
-                let descs: Vec<String> = routing
-                    .candidates
-                    .iter()
-                    .map(|c| {
-                        let desc = ancestor_descs.get(c).cloned().unwrap_or_default();
-                        if desc.is_empty() {
-                            c.clone()
-                        } else {
-                            format!("{c} ({desc})")
-                        }
-                    })
-                    .collect();
-                format!("Ambiguous: {}", descs.join(", "))
-            } else {
-                format!("Unmatched: {}", routing.reason)
-            };
-            println!("{target_desc}");
-
-            // Prompt loop — single keypress, no Enter needed
-            loop {
-                print!("[a]bsorb / [A]bsorb file / [s]kip / [S]kip file / [t]arget / [q]uit: ");
-                std::io::Write::flush(&mut std::io::stdout())?;
-                let ch = match read_char(&term, is_tty) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        // EOF — treat as quit
-                        quit = true;
-                        routing.target = None;
-                        routing.reason = "skipped (quit)";
-                        break;
-                    }
-                };
-                if is_tty {
-                    println!(); // newline after the keypress echo
-                }
-
-                match ch {
-                    'a' => {
-                        if routing.target.is_none() {
-                            println!("No target set. Use [t] to pick a target first.");
-                            continue;
-                        }
-                        break;
-                    }
-                    'A' => {
-                        if routing.target.is_none() {
-                            println!("No target set. Use [t] to pick a target first.");
-                            continue;
-                        }
-                        absorb_file = Some(routing.file.clone());
-                        break;
-                    }
-                    's' => {
-                        routing.target = None;
-                        routing.reason = "skipped";
-                        break;
-                    }
-                    'S' => {
-                        skip_file = Some(routing.file.clone());
-                        routing.target = None;
-                        routing.reason = "skipped (file)";
-                        break;
-                    }
-                    't' | 'T' => {
-                        // Show numbered list of ancestors
-                        println!("Select target:");
-                        for (i, cid) in ancestor_list.iter().enumerate() {
-                            let desc = ancestor_descs.get(cid).cloned().unwrap_or_default();
-                            if desc.is_empty() {
-                                println!("  {}: {cid}", i + 1);
-                            } else {
-                                println!("  {}: {cid} ({desc})", i + 1);
-                            }
-                        }
-                        print!("Enter number: ");
-                        std::io::Write::flush(&mut std::io::stdout())?;
-                        // Target selection still uses line input for the number
-                        let mut num_input = String::new();
-                        std::io::stdin().read_line(&mut num_input)?;
-                        if let Ok(n) = num_input.trim().parse::<usize>() {
-                            if n >= 1 && n <= ancestor_list.len() {
-                                routing.target = Some(ancestor_list[n - 1].clone());
-                                routing.reason = "retargeted";
-                                let desc = ancestor_descs.get(&ancestor_list[n - 1]).cloned().unwrap_or_default();
-                                println!("→ Retargeted to {}{}", ancestor_list[n - 1],
-                                    if desc.is_empty() { String::new() } else { format!(" ({desc})") });
-                                break;
-                            }
-                        }
-                        println!("Invalid selection.");
-                        continue;
-                    }
-                    'q' | 'Q' => {
-                        quit = true;
-                        routing.target = None;
-                        routing.reason = "skipped (quit)";
-                        break;
-                    }
-                    '\n' | '\r' | ' ' => continue,
-                    _ => {
-                        println!("Unknown action. Use a/A/s/S/t/q.");
-                        continue;
-                    }
-                }
-            }
-        }
-    }
-
-    // 4. Print routing plan
-    let absorbed: Vec<&(HunkRouting, HunkFingerprint)> =
-        routings.iter().filter(|(r, _)| r.target.is_some()).collect();
-    let ambiguous: Vec<&(HunkRouting, HunkFingerprint)> = routings
-        .iter()
-        .filter(|(r, _)| r.reason == "ambiguous")
-        .collect();
-    let unmatched: Vec<&(HunkRouting, HunkFingerprint)> = routings
-        .iter()
-        .filter(|(r, _)| r.target.is_none() && r.reason != "ambiguous")
-        .collect();
-
-    if absorbed.is_empty() {
-        println!("Nothing to absorb: no hunks matched any ancestor.");
-        if !ambiguous.is_empty() {
-            println!("\nAmbiguous (staying in {source}):");
-            for (r, _) in &ambiguous {
-                let descs: Vec<String> = r
-                    .candidates
-                    .iter()
-                    .map(|c| {
-                        let desc = ancestor_descs.get(c).cloned().unwrap_or_default();
-                        if desc.is_empty() {
-                            c.clone()
-                        } else {
-                            format!("{c} ({desc})")
-                        }
-                    })
-                    .collect();
-                println!(
-                    "  {} ({} +{} -{}) — overlaps {}",
-                    r.hunk_id,
-                    r.file,
-                    r.additions,
-                    r.deletions,
-                    descs.join(", ")
-                );
-            }
-        }
-        if !unmatched.is_empty() {
-            println!("\nUnmatched (staying in {source}):");
-            for (r, _) in &unmatched {
-                println!(
-                    "  {} ({} +{} -{}) — {}",
-                    r.hunk_id, r.file, r.additions, r.deletions, r.reason
-                );
-            }
-        }
-        return Ok(());
-    }
-
-    let verb = if dry_run { "Would absorb" } else { "Absorbed" };
-    println!("{verb} {} hunk(s):", absorbed.len());
-    for (r, _) in &absorbed {
-        let target = r.target.as_ref().unwrap();
-        let desc = ancestor_descs.get(target).cloned().unwrap_or_default();
-        let desc_part = if desc.is_empty() {
-            String::new()
-        } else {
-            format!(" ({desc})")
-        };
-        println!(
-            "  {} ({} +{} -{}) → {target}{desc_part}",
-            r.hunk_id, r.file, r.additions, r.deletions
+        return hits;
+    };
+    if debug {
+        eprintln!(
+            "debug: hunk {id} ({file}): old range starts at line {old_start}, \
+             annotation has {} lines",
+            annotations.len(),
+            file = hunk.file,
         );
     }
+
+    let mut old_line = old_start; // 1-based
+    for line in &hunk.lines {
+        if line.starts_with('-') {
+            let ann_idx = old_line.saturating_sub(1);
+            if let Some(change_id) = annotations.get(ann_idx) {
+                let is_mutable = ancestors.contains(change_id);
+                if debug {
+                    eprintln!(
+                        "debug: hunk {id}: deleted line {old_line} -> \
+                         change {change_id} (mutable: {is_mutable})"
+                    );
+                }
+                if is_mutable {
+                    *hits.entry(change_id.clone()).or_insert(0) += 1;
+                }
+            } else if debug {
+                eprintln!(
+                    "debug: hunk {id}: deleted line {old_line} -> \
+                     annotation index {ann_idx} out of bounds \
+                     (annotations len: {})",
+                    annotations.len()
+                );
+            }
+            old_line += 1;
+        } else if line.starts_with('+') {
+            // Addition: doesn't consume an old line
+        } else {
+            // Context line: consumes an old line but don't count it
+            old_line += 1;
+        }
+    }
+
+    hits
+}
+
+/// Let the user accept/skip/retarget each routed hunk, one keypress each.
+fn interactive_review(
+    routings: &mut [(HunkRouting, HunkFingerprint)],
+    selected: &[(&str, &DiffHunk)],
+    ancestors: &HashSet<String>,
+    ancestor_descs: &HashMap<String, String>,
+) -> Result<()> {
+    let ancestor_list: Vec<String> = ancestors.iter().cloned().collect();
+    let mut quit = false;
+    let mut skip_file: Option<String> = None;
+    let mut absorb_file: Option<String> = None;
+
+    // Read single chars: use console::Term for TTY, raw bytes for piped stdin
+    let term = console::Term::stdout();
+    let is_tty = term.is_term();
+
+    let read_char = |term: &console::Term, is_tty: bool| -> Result<char> {
+        if is_tty {
+            Ok(term.read_char()?)
+        } else {
+            use std::io::Read;
+            let mut buf = [0u8; 1];
+            let n = std::io::stdin().lock().read(&mut buf)?;
+            if n == 0 {
+                bail!("unexpected end of input");
+            }
+            Ok(buf[0] as char)
+        }
+    };
+
+    for (routing, _fp) in routings.iter_mut() {
+        if quit {
+            routing.target = None;
+            routing.reason = "skipped (quit)";
+            continue;
+        }
+
+        if let Some(ref sf) = skip_file {
+            if routing.file == *sf {
+                routing.target = None;
+                routing.reason = "skipped (file)";
+                continue;
+            } else {
+                skip_file = None;
+            }
+        }
+
+        if let Some(ref af) = absorb_file {
+            if routing.file == *af {
+                // Auto-absorb: keep existing target (if any)
+                continue;
+            } else {
+                absorb_file = None;
+            }
+        }
+
+        // Find the original hunk to display its content
+        let hunk_opt = selected
+            .iter()
+            .find(|(id, _)| *id == routing.hunk_id)
+            .map(|(_, h)| *h);
+
+        // Display hunk with syntax highlighting and absolute line numbers
+        let header_style = if is_tty { Style::new().bold() } else { Style::new() };
+        println!(
+            "\n{} {} (+{} -{})",
+            header_style.apply_to(&routing.hunk_id),
+            header_style.apply_to(&routing.file),
+            routing.additions,
+            routing.deletions,
+        );
+        if let Some(hunk) = hunk_opt {
+            print!("{}", format_hunk_display(hunk, is_tty));
+        }
+
+        // Show current target
+        let target_desc = if let Some(ref t) = routing.target {
+            format!("Target: {}", describe_change(t, ancestor_descs))
+        } else if routing.reason == "ambiguous" {
+            format!(
+                "Ambiguous: {}",
+                describe_changes(&routing.candidates, ancestor_descs)
+            )
+        } else {
+            format!("Unmatched: {}", routing.reason)
+        };
+        println!("{target_desc}");
+
+        // Prompt loop — single keypress, no Enter needed
+        loop {
+            print!("[a]bsorb / [A]bsorb file / [s]kip / [S]kip file / [t]arget / [q]uit: ");
+            std::io::Write::flush(&mut std::io::stdout())?;
+            let ch = match read_char(&term, is_tty) {
+                Ok(c) => c,
+                Err(_) => {
+                    // EOF — treat as quit
+                    quit = true;
+                    routing.target = None;
+                    routing.reason = "skipped (quit)";
+                    break;
+                }
+            };
+            if is_tty {
+                println!(); // newline after the keypress echo
+            }
+
+            match ch {
+                'a' => {
+                    if routing.target.is_none() {
+                        println!("No target set. Use [t] to pick a target first.");
+                        continue;
+                    }
+                    break;
+                }
+                'A' => {
+                    if routing.target.is_none() {
+                        println!("No target set. Use [t] to pick a target first.");
+                        continue;
+                    }
+                    absorb_file = Some(routing.file.clone());
+                    break;
+                }
+                's' => {
+                    routing.target = None;
+                    routing.reason = "skipped";
+                    break;
+                }
+                'S' => {
+                    skip_file = Some(routing.file.clone());
+                    routing.target = None;
+                    routing.reason = "skipped (file)";
+                    break;
+                }
+                't' | 'T' => {
+                    // Show numbered list of ancestors
+                    println!("Select target:");
+                    for (i, cid) in ancestor_list.iter().enumerate() {
+                        println!("  {}: {}", i + 1, describe_change(cid, ancestor_descs));
+                    }
+                    print!("Enter number: ");
+                    std::io::Write::flush(&mut std::io::stdout())?;
+                    // Target selection still uses line input for the number
+                    let mut num_input = String::new();
+                    std::io::stdin().read_line(&mut num_input)?;
+                    if let Ok(n) = num_input.trim().parse::<usize>()
+                        && n >= 1
+                        && n <= ancestor_list.len()
+                    {
+                        let target = &ancestor_list[n - 1];
+                        routing.target = Some(target.clone());
+                        routing.reason = "retargeted";
+                        println!("→ Retargeted to {}", describe_change(target, ancestor_descs));
+                        break;
+                    }
+                    println!("Invalid selection.");
+                    continue;
+                }
+                'q' | 'Q' => {
+                    quit = true;
+                    routing.target = None;
+                    routing.reason = "skipped (quit)";
+                    break;
+                }
+                '\n' | '\r' | ' ' => continue,
+                _ => {
+                    println!("Unknown action. Use a/A/s/S/t/q.");
+                    continue;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// "id" or "id (first line of description)".
+fn describe_change(change_id: &str, descs: &HashMap<String, String>) -> String {
+    match descs.get(change_id) {
+        Some(desc) if !desc.is_empty() => format!("{change_id} ({desc})"),
+        _ => change_id.to_string(),
+    }
+}
+
+/// Comma-separated [`describe_change`] for a list of change IDs.
+fn describe_changes(change_ids: &[String], descs: &HashMap<String, String>) -> String {
+    change_ids
+        .iter()
+        .map(|c| describe_change(c, descs))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Print the ambiguous/unmatched hunks that stay in `source`.
+fn print_leftovers(
+    ambiguous: &[&HunkRouting],
+    unmatched: &[&HunkRouting],
+    source: &str,
+    ancestor_descs: &HashMap<String, String>,
+) {
     if !ambiguous.is_empty() {
         println!("\nAmbiguous (staying in {source}):");
-        for (r, _) in &ambiguous {
-            let descs: Vec<String> = r
-                .candidates
-                .iter()
-                .map(|c| {
-                    let desc = ancestor_descs.get(c).cloned().unwrap_or_default();
-                    if desc.is_empty() {
-                        c.clone()
-                    } else {
-                        format!("{c} ({desc})")
-                    }
-                })
-                .collect();
+        for r in ambiguous {
             println!(
                 "  {} ({} +{} -{}) — overlaps {}",
                 r.hunk_id,
                 r.file,
                 r.additions,
                 r.deletions,
-                descs.join(", ")
+                describe_changes(&r.candidates, ancestor_descs),
             );
         }
     }
     if !unmatched.is_empty() {
         println!("\nUnmatched (staying in {source}):");
-        for (r, _) in &unmatched {
+        for r in unmatched {
             println!(
                 "  {} ({} +{} -{}) — {}",
                 r.hunk_id, r.file, r.additions, r.deletions, r.reason
             );
         }
     }
+}
 
-    if dry_run {
-        return Ok(());
-    }
+/// Squash routed hunks into their targets, one jj squash per target.
+/// Hunks are re-matched by fingerprint because the diff (and thus hunk IDs
+/// and positions) shifts after each squash.
+fn execute_absorb(
+    routings: &[(HunkRouting, HunkFingerprint)],
+    source: &str,
+    debug: bool,
+) -> Result<()> {
+    use crate::diff;
 
-    // Record the current operation ID for undo hint
+    // Record the current operation ID for the undo hint
     let pre_op_id = diff::get_current_op_id()?;
 
-    // 5. Execute: sequential squash per target, re-identifying by fingerprint
-    // Group absorbed hunks by target
-    let mut target_groups: std::collections::HashMap<String, Vec<HunkFingerprint>> =
-        std::collections::HashMap::new();
-    for (r, fp) in &routings {
+    let mut target_groups: HashMap<String, Vec<HunkFingerprint>> = HashMap::new();
+    for (r, fp) in routings {
         if let Some(ref target) = r.target {
             target_groups
                 .entry(target.clone())
@@ -1025,17 +1002,14 @@ pub fn absorb_hunks(
     for (target, fingerprints) in &target_groups {
         // Re-get current diff (it changes after each squash)
         let raw = diff::get_jj_diff(&Some(source.to_string()), debug)?;
-        let hunks = crate::diff::parse_diff(&raw);
-        let identified = crate::diff::assign_ids(&hunks);
+        let hunks = diff::parse_diff(&raw);
+        let identified = diff::assign_ids(&hunks);
 
-        // Match current hunks to fingerprints
-        let mut specs: Vec<HunkSpec<'_>> = Vec::new();
-        for (hid, hunk) in &identified {
-            let fp = HunkFingerprint::from_hunk(hunk);
-            if fingerprints.contains(&fp) {
-                specs.push((hid.as_str(), *hunk, vec![]));
-            }
-        }
+        let specs: Vec<HunkSpec<'_>> = identified
+            .iter()
+            .filter(|(_, hunk)| fingerprints.contains(&HunkFingerprint::from_hunk(hunk)))
+            .map(|(hid, hunk)| (hid.as_str(), *hunk, vec![]))
+            .collect();
 
         if specs.is_empty() {
             if debug {
