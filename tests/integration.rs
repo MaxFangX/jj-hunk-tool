@@ -617,7 +617,10 @@ fn patch_reverse_whole_hunk() {
     let id = repo.get_single_hunk_id(&[]);
     let patch = repo.tool_ok(&["patch", "--reverse", &id]);
     assert!(patch.contains("a.txt"));
-    assert!(patch.contains("+added"));
+    assert!(
+        patch.contains("-added"),
+        "reverse patch should remove the addition: {patch}"
+    );
 }
 
 #[test]

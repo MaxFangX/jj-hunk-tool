@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use std::collections::HashSet;
 use std::process::Command;
 
-pub use git_surgeon::diff::{check_supported, parse_diff};
+pub use git_surgeon::diff::parse_diff;
 pub use git_surgeon::hunk_id::assign_ids;
 
 /// True if a diff-side path is the /dev/null marker (file added or deleted).

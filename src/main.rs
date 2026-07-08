@@ -37,7 +37,7 @@ enum Command {
         /// Revision to diff
         #[arg(short, long)]
         revision: Option<String>,
-        /// Reverse the patch (for discarding)
+        /// Reverse the patch; applying it forward undoes the changes
         #[arg(long)]
         reverse: bool,
     },
@@ -235,22 +235,8 @@ fn main() -> Result<()> {
             let raw = get_jj_diff(&revision, debug)?;
             let hunks = parse_diff(&raw);
             let identified = assign_ids(&hunks);
-            for raw_spec in &hunk_ids {
-                let (id, ranges) = parse_id_range(raw_spec)?;
-                let (_id, hunk) = identified
-                    .iter()
-                    .find(|(hid, _)| hid == id)
-                    .ok_or_else(|| anyhow::anyhow!("hunk not found: {id}"))?;
-                diff::check_supported(hunk, id)?;
-                let patched = if !ranges.is_empty() {
-                    git_surgeon::patch::slice_hunk_multi(hunk, &ranges, reverse)?
-                } else if reverse {
-                    git_surgeon::patch::slice_hunk(hunk, 1, hunk.lines.len(), true)?
-                } else {
-                    (*hunk).clone()
-                };
-                print!("{}", git_surgeon::patch::build_patch(&patched));
-            }
+            let specs = resolve_hunk_specs(&hunk_ids, &identified)?;
+            print!("{}", tool::build_combined_patch(&specs, reverse)?);
         }
         Command::Split {
             hunk_ids,
