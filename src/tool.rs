@@ -1079,7 +1079,7 @@ pub fn jj_tool_apply(left: &str, right: &str) -> Result<()> {
     // of a deletion. Remove such files.
     let patch_text = std::fs::read_to_string(&patch_path)
         .with_context(|| format!("reading patch {patch_path}"))?;
-    for hunk in git_surgeon::diff::parse_diff(&patch_text) {
+    for hunk in crate::diff::parse_diff(&patch_text) {
         if !crate::diff::is_dev_null(&hunk.new_file) {
             continue;
         }

@@ -1031,6 +1031,77 @@ fn squash_invalid_id() {
     assert!(err.contains("hunk not found"));
 }
 
+/// Regression test: a partial hunk selection that excludes a modification of
+/// `--`-comment lines. Deleting `-- text` renders as `--- text` in the diff,
+/// which the old parser swallowed as a file header — leaking a stray deletion
+/// line into the rebuilt patch and breaking it.
+#[test]
+fn squash_partial_hunk_excluding_dash_dash_comment_modification() {
+    let repo = TestRepo::new();
+    let base = "\
+local a = require('a')
+local b = require('b')
+
+local x = 1
+local y = 2
+local z = 3
+local w = 4
+
+local function existing()
+  return 1
+end
+
+-- header comment stays
+-- second line original
+-- third line original ending
+function get_title() end
+";
+    repo.commit_file("f.lua", base);
+    let changed = base
+        .replace(
+            "local b = require('b')\n",
+            "local b = require('b')\nlocal c = require('c')\n",
+        )
+        .replace(
+            "end\n\n-- header",
+            "end\n\nlocal function new_method()\n  return 2\nend\n\n-- header",
+        )
+        .replace("-- second line original\n", "-- second line changed\n")
+        .replace("-- third line original ending\n", "-- third line changed\n");
+    repo.write_file("f.lua", &changed);
+
+    // Two hunks: the require insertion, and the combined new_method insertion
+    // + comment modification. The old parser hid the comment deletions (+6 -0).
+    let ids = repo.get_hunk_ids(&[]);
+    assert_eq!(ids.len(), 2, "expected 2 hunks: {ids:?}");
+    assert!(
+        ids[1].1.contains("+6 -2"),
+        "combined hunk should count the comment deletions: {}",
+        ids[1].1
+    );
+
+    // Squash the require hunk plus only the new_method lines (4-7), leaving
+    // the comment modification behind.
+    let ranged = format!("{}:4-7", ids[1].0);
+    repo.tool_ok(&["squash", &ids[0].0, &ranged, "--into", "@-"]);
+
+    // The working copy tree is unchanged overall...
+    assert_eq!(repo.read_file("f.lua"), changed);
+
+    // ...the parent gained the two insertions but not the comment edits...
+    let parent_diff = repo.jj_diff("@-");
+    assert!(parent_diff.contains("+local c = require('c')"));
+    assert!(parent_diff.contains("+local function new_method()"));
+    assert!(!parent_diff.contains("line changed"));
+
+    // ...and only the comment modification remains in @.
+    let wc_diff = repo.jj_diff("@");
+    assert!(wc_diff.contains("--- second line original"));
+    assert!(wc_diff.contains("+-- second line changed"));
+    assert!(!wc_diff.contains("new_method"));
+    assert!(!wc_diff.contains("require('c')"));
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // diffedit
 // ──────────────────────────────────────────────────────────────────────────────

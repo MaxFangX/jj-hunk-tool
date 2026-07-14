@@ -1,9 +1,153 @@
 use anyhow::{Result, bail};
+use git_surgeon::diff::DiffHunk;
 use std::collections::HashSet;
 use std::process::Command;
 
-pub use git_surgeon::diff::parse_diff;
 pub use git_surgeon::hunk_id::assign_ids;
+
+/// Preamble lines that indicate unsupported metadata operations.
+/// Note: "new file mode" and "deleted file mode" are supported (they work fine
+/// with the --- /dev/null or +++ /dev/null headers we already capture).
+const UNSUPPORTED_PREAMBLE_PREFIXES: &[&str] = &[
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+    "old mode ",
+    "new mode ",
+    "similarity index ",
+    "dissimilarity index ",
+];
+
+/// Parse a unified diff into hunks.
+///
+/// Replaces `git_surgeon::diff::parse_diff`, which treats any line starting
+/// with "--- "/"+++ " as a file header — even inside a hunk body, where such
+/// lines are content (deleting a `-- comment` line renders as `--- comment`).
+/// That swallowed the line as a bogus header, corrupting rebuilt patches.
+/// This version tracks the line counts from each @@ header, so lines within
+/// a hunk body are always taken as content.
+pub fn parse_diff(input: &str) -> Vec<DiffHunk> {
+    #[derive(Default)]
+    struct Builder {
+        old_file: String,
+        new_file: String,
+        file_header: String,
+        header: Option<String>,
+        lines: Vec<String>,
+        unsupported: Option<String>,
+    }
+
+    impl Builder {
+        fn flush(&mut self, hunks: &mut Vec<DiffHunk>) {
+            if let Some(header) = self.header.take() {
+                hunks.push(DiffHunk {
+                    file: display_file(&self.old_file, &self.new_file),
+                    old_file: self.old_file.clone(),
+                    new_file: self.new_file.clone(),
+                    file_header: self.file_header.clone(),
+                    header,
+                    lines: std::mem::take(&mut self.lines),
+                    unsupported_metadata: self.unsupported.clone(),
+                });
+            }
+        }
+    }
+
+    let mut hunks = Vec::new();
+    let mut cur = Builder::default();
+    // Body lines of the current @@ hunk still unaccounted for, per side.
+    let mut old_left = 0usize;
+    let mut new_left = 0usize;
+
+    for line in input.lines() {
+        // Inside a hunk body every line is content, even metadata lookalikes.
+        if cur.header.is_some() && (old_left > 0 || new_left > 0) {
+            match line.as_bytes().first() {
+                Some(b'+') => new_left = new_left.saturating_sub(1),
+                Some(b'-') => old_left = old_left.saturating_sub(1),
+                Some(b'\\') => {} // "\ No newline at end of file"
+                _ => {
+                    // Context lines advance both sides.
+                    old_left = old_left.saturating_sub(1);
+                    new_left = new_left.saturating_sub(1);
+                }
+            }
+            cur.lines.push(line.to_string());
+            continue;
+        }
+
+        if line.starts_with("diff --git") {
+            cur.flush(&mut hunks);
+            cur = Builder::default();
+        } else if cur.unsupported.is_none()
+            && let Some(prefix) = UNSUPPORTED_PREAMBLE_PREFIXES
+                .iter()
+                .find(|p| line.starts_with(*p))
+        {
+            cur.unsupported = Some(prefix.trim().to_string());
+        }
+
+        if line.starts_with("--- ") {
+            cur.file_header = line.to_string();
+            cur.old_file = strip_diff_prefix(line).to_string();
+        } else if line.starts_with("+++ ") {
+            cur.file_header.push('\n');
+            cur.file_header.push_str(line);
+            cur.new_file = strip_diff_prefix(line).to_string();
+        } else if line.starts_with("@@ ") {
+            cur.flush(&mut hunks);
+            (old_left, new_left) = parse_header_counts(line);
+            cur.header = Some(line.to_string());
+        } else if cur.header.is_some() {
+            // Counts exhausted; keep trailers like "\ No newline at end of file".
+            cur.lines.push(line.to_string());
+        }
+    }
+    cur.flush(&mut hunks);
+
+    hunks
+}
+
+/// Parse (old_count, new_count) from "@@ -start[,count] +start[,count] @@...".
+/// A missing count means 1; a malformed header yields (0, 0), which falls
+/// back to prefix-based body parsing.
+fn parse_header_counts(header: &str) -> (usize, usize) {
+    fn count(range: &str) -> Option<usize> {
+        match range.split_once(',') {
+            Some((_, c)) => c.parse().ok(),
+            None => Some(1),
+        }
+    }
+    let parsed = (|| {
+        let ranges = header.strip_prefix("@@ -")?.split(" @@").next()?;
+        let (old, new) = ranges.split_once(" +")?;
+        Some((count(old)?, count(new)?))
+    })();
+    parsed.unwrap_or((0, 0))
+}
+
+/// Extract a file path from a `--- a/...` or `+++ b/...` line.
+fn strip_diff_prefix(line: &str) -> &str {
+    line.strip_prefix("--- a/")
+        .or_else(|| line.strip_prefix("+++ b/"))
+        .or_else(|| line.strip_prefix("--- /"))
+        .or_else(|| line.strip_prefix("+++ /"))
+        .or_else(|| line.strip_prefix("+++ a/"))
+        .or_else(|| line.strip_prefix("--- "))
+        .or_else(|| line.strip_prefix("+++ "))
+        .unwrap_or(line)
+}
+
+/// Choose the display path for a hunk. Prefer new-side, fall back to old-side
+/// for deletions where new is /dev/null.
+fn display_file(old: &str, new: &str) -> String {
+    if new == "dev/null" || new.is_empty() {
+        old.to_string()
+    } else {
+        new.to_string()
+    }
+}
 
 /// True if a diff-side path is the /dev/null marker (file added or deleted).
 /// `parse_diff` strips the leading slash, so match both spellings.
@@ -196,5 +340,129 @@ mod tests {
     fn preserve_crlf_leaves_lf_content_alone() {
         let raw = "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-old\n+new\n";
         assert_eq!(preserve_crlf(raw), raw);
+    }
+
+    #[test]
+    fn parse_diff_keeps_dash_dash_deletions_as_content() {
+        // Deleting a `-- comment` line renders as `--- comment`, which must
+        // parse as hunk content, not as an old-file header.
+        let raw = "\
+diff --git a/f.lua b/f.lua
+--- a/f.lua
++++ b/f.lua
+@@ -1,3 +1,3 @@
+ -- header stays
+--- old comment
++-- new comment
+";
+        let hunks = parse_diff(raw);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "f.lua");
+        assert_eq!(hunks[0].file_header, "--- a/f.lua\n+++ b/f.lua");
+        assert_eq!(
+            hunks[0].lines,
+            vec![" -- header stays", "--- old comment", "+-- new comment"]
+        );
+    }
+
+    #[test]
+    fn parse_diff_body_lookalikes_do_not_leak_into_next_hunk() {
+        // A body containing `--- x`, `+++ x`, and a context `@@ x` line must
+        // not disturb the following hunk's file header or boundaries.
+        let raw = "\
+diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ b/f.txt
+@@ -1,2 +1,2 @@
+--- minus minus line
++++ plus plus line
+ @@ context at-signs
+@@ -10,1 +10,1 @@
+-second hunk old
++second hunk new
+";
+        let hunks = parse_diff(raw);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(
+            hunks[0].lines,
+            vec![
+                "--- minus minus line",
+                "+++ plus plus line",
+                " @@ context at-signs"
+            ]
+        );
+        assert_eq!(hunks[1].file_header, "--- a/f.txt\n+++ b/f.txt");
+        assert_eq!(hunks[1].header, "@@ -10,1 +10,1 @@");
+        assert_eq!(hunks[1].lines, vec!["-second hunk old", "+second hunk new"]);
+    }
+
+    #[test]
+    fn parse_diff_multiple_files() {
+        let raw = "\
+diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,1 +1,1 @@
+-a old
++a new
+diff --git a/b.txt b/b.txt
+--- a/b.txt
++++ b/b.txt
+@@ -1,1 +1,2 @@
+ b
++b more
+";
+        let hunks = parse_diff(raw);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].file, "a.txt");
+        assert_eq!(hunks[1].file, "b.txt");
+        assert_eq!(hunks[1].lines, vec![" b", "+b more"]);
+    }
+
+    #[test]
+    fn parse_diff_new_and_deleted_files() {
+        let raw = "\
+diff --git a/new.txt b/new.txt
+new file mode 100644
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,1 @@
++hello
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+--- a/gone.txt
++++ /dev/null
+@@ -1,1 +0,0 @@
+-bye
+\\ No newline at end of file
+";
+        let hunks = parse_diff(raw);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].old_file, "dev/null");
+        assert_eq!(hunks[0].file, "new.txt");
+        assert_eq!(hunks[1].new_file, "dev/null");
+        assert_eq!(hunks[1].file, "gone.txt");
+        assert_eq!(hunks[1].lines, vec!["-bye", "\\ No newline at end of file"]);
+    }
+
+    #[test]
+    fn parse_diff_flags_unsupported_metadata() {
+        let raw = "\
+diff --git a/old.txt b/renamed.txt
+similarity index 90%
+rename from old.txt
+rename to renamed.txt
+--- a/old.txt
++++ b/renamed.txt
+@@ -1,1 +1,1 @@
+-x
++y
+";
+        let hunks = parse_diff(raw);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(
+            hunks[0].unsupported_metadata.as_deref(),
+            Some("similarity index")
+        );
     }
 }
